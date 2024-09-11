@@ -1,0 +1,9 @@
+# ---> Go
+# Test binary, build with `go test -c`
+*.test
+
+# IDE shenanigans
+*.iml
+.idea/
+
+
