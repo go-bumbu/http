@@ -34,7 +34,7 @@ func New(cfg Cfg) (*Server, error) {
 		return nil, fmt.Errorf("server address canot be empty")
 
 	}
-	if cfg.SkipObs == false && cfg.ObsAddr == "" {
+	if !cfg.SkipObs && cfg.ObsAddr == "" {
 		return nil, fmt.Errorf("obserbavility server address canot be empty")
 	}
 

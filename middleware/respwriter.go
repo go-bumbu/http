@@ -2,7 +2,8 @@ package middleware
 
 import (
 	"bytes"
-	"github.com/andresbott/go-carbon/libs/limitedbuffer"
+	"github.com/go-bumbu/http/lib/limitio"
+
 	"net/http"
 	"strconv"
 )
@@ -13,7 +14,7 @@ type StatWriter struct {
 	http.ResponseWriter
 	statusCode    int
 	interceptBody bool // write a limited amount of chars into a buffer in case a non 200 code
-	buf           limitedbuffer.Buffer
+	buf           *limitio.LimitedBuf
 	headerWritten bool // only write header once
 }
 
@@ -27,9 +28,9 @@ func NewWriter(w http.ResponseWriter, teeBodyOnErr bool) *StatWriter {
 		ResponseWriter: w,
 		statusCode:     http.StatusOK,
 		interceptBody:  teeBodyOnErr,
-		buf: limitedbuffer.Buffer{
-			Size: 1000,
-			Buf:  &bytes.Buffer{},
+		buf: &limitio.LimitedBuf{
+			Buffer:   bytes.Buffer{},
+			MaxBytes: 2000,
 		},
 	}
 }

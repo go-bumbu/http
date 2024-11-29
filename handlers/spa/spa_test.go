@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"embed"
-	"github.com/google/go-cmp/cmp"
 	"io"
 	"io/fs"
 	"net/http"
@@ -11,6 +10,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/google/go-cmp/cmp"
 )
 
 //go:embed testdata/ui/*
