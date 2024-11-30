@@ -2,6 +2,12 @@
 
 The Http module contains a set uf useful http packages that can be used in any Http backend project.
 
+## Import
+
+Import the module
+```
+go get github.com/go-bumbu/http
+```
 
 ## Server
 
@@ -11,6 +17,8 @@ Features:
   * the observability handler is intended to expose details like metrics, runtime controls or hprof endpoint
 * the server can safely shut down with os kill signals
 * it exposes a Stop() method to safely shut down both servers.
+
+
 
 ## Middleware
 

@@ -2,7 +2,7 @@ package middleware
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/rs/zerolog"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -57,7 +57,7 @@ func PromMiddleware(next http.Handler, histogram Histogram) http.Handler {
 	})
 }
 
-func PromLogMiddleware(next http.Handler, histogram Histogram, l *zerolog.Logger) http.Handler {
+func PromLogMiddleware(next http.Handler, histogram Histogram, l *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		timeStart := time.Now()
 		respWriter := NewWriter(w, false)
