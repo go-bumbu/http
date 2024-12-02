@@ -20,19 +20,25 @@ func SlogMiddleware(next http.Handler, l *slog.Logger) http.Handler {
 }
 
 func log(l *slog.Logger, r *http.Request, statusCode int, dur time.Duration) {
-	attr := []slog.Attr{
-		slog.String("method", r.Method),
-		slog.String("url", r.RequestURI),
-		slog.Duration("req-dur", dur),
-		slog.Int("response-code", statusCode),
-		slog.String("ip", userIp(r)),
-		slog.String("req-id", r.Header.Get("Request-Id")),
-	}
 
 	if IsStatusError(statusCode) {
-		l.Error("", attr)
+		l.Error("",
+			slog.String("method", r.Method),
+			slog.String("url", r.RequestURI),
+			slog.Duration("req-dur", dur),
+			slog.Int("response-code", statusCode),
+			slog.String("ip", userIp(r)),
+			slog.String("req-id", r.Header.Get("Request-Id")),
+		)
 	} else {
-		l.Info("", attr)
+		l.Info("",
+			slog.String("method", r.Method),
+			slog.String("url", r.RequestURI),
+			slog.Duration("req-dur", dur),
+			slog.Int("response-code", statusCode),
+			slog.String("ip", userIp(r)),
+			slog.String("req-id", r.Header.Get("Request-Id")),
+		)
 	}
 }
 
