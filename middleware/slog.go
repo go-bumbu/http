@@ -6,32 +6,22 @@ import (
 	"time"
 )
 
-// SlogMiddleware logs every request using the provided slogger
-func SlogMiddleware(next http.Handler, l *slog.Logger) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		timeStart := time.Now()
-		respWriter := NewWriter(w, false)
-		// serve the request
-		next.ServeHTTP(respWriter, r)
-		// get the duration
-		timeDiff := time.Since(timeStart)
-		log(l, r, respWriter.StatusCode(), timeDiff)
-	})
-}
-
-func log(l *slog.Logger, r *http.Request, statusCode int, dur time.Duration) {
-
-	if IsStatusError(statusCode) {
-		l.Error("",
+func (c *Middleware) log(r *http.Request, statusCode int, errmsg string, dur time.Duration) {
+	if c.logger == nil {
+		return
+	}
+	if IsServerErr(statusCode) {
+		c.logger.Error("",
 			slog.String("method", r.Method),
 			slog.String("url", r.RequestURI),
 			slog.Duration("req-dur", dur),
 			slog.Int("response-code", statusCode),
 			slog.String("ip", userIp(r)),
 			slog.String("req-id", r.Header.Get("Request-Id")),
+			slog.String("err-handlerMsg", errmsg),
 		)
 	} else {
-		l.Info("",
+		c.logger.Info("",
 			slog.String("method", r.Method),
 			slog.String("url", r.RequestURI),
 			slog.Duration("req-dur", dur),

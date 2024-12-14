@@ -3,7 +3,6 @@ package middleware
 import (
 	"bytes"
 	"github.com/go-bumbu/http/lib/limitio"
-
 	"net/http"
 	"strconv"
 )
@@ -62,4 +61,7 @@ func (r *StatWriter) WriteHeader(code int) {
 
 func IsStatusError(statusCode int) bool {
 	return statusCode < 200 || statusCode >= 400
+}
+func IsServerErr(statusCode int) bool {
+	return statusCode < 200 || statusCode >= 500
 }

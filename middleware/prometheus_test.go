@@ -1,7 +1,6 @@
 package middleware_test
 
 import (
-	"fmt"
 	"github.com/go-bumbu/http/middleware"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -12,13 +11,6 @@ import (
 	"strings"
 	"testing"
 )
-
-func testHandler(statusCode int, message string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(statusCode)
-		fmt.Fprint(w, message)
-	})
-}
 
 func TestPromMiddleware(t *testing.T) {
 	tcs := []struct {
@@ -65,9 +57,15 @@ func TestPromMiddleware(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 
 			reg := prometheus.NewRegistry()
-			hist := middleware.NewHistogram(tc.metricPrefix, nil, reg)
+			hist := middleware.NewPromHistogram(tc.metricPrefix, nil, reg)
 
-			promHandler := middleware.PromMiddleware(testHandler(tc.statusCode, "ok"), hist)
+			m := middleware.New(middleware.Cfg{
+				JsonErrors: false,
+				Logger:     nil,
+				Histogram:  hist,
+			})
+
+			promHandler := m.Middleware(testHandler(tc.statusCode, "ok"))
 			tc.requests(promHandler)
 
 			rec := httptest.NewRecorder()
