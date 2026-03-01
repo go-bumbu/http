@@ -115,7 +115,7 @@ func TestSpaHandler(t *testing.T) {
 							// field tc.data used to verify the file content
 							if w.Code == http.StatusOK && tc.data != "" {
 								resp := w.Result()
-								defer resp.Body.Close()
+								defer func() { _ = resp.Body.Close() }()
 
 								data, err := io.ReadAll(resp.Body)
 								if err != nil {

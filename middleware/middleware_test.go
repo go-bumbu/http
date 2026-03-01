@@ -13,7 +13,7 @@ import (
 func testHandler(statusCode int, message string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(statusCode)
-		fmt.Fprint(w, message)
+		_, _ = fmt.Fprint(w, message)
 	})
 }
 

@@ -19,12 +19,13 @@ type Server struct {
 }
 
 type Cfg struct {
-	Addr       string
-	Handler    http.Handler
-	SkipObs    bool
-	ObsAddr    string
-	ObsHandler http.Handler
-	Logger     func(msg string, isErr bool)
+	Addr              string
+	Handler           http.Handler
+	SkipObs           bool
+	ObsAddr           string
+	ObsHandler        http.Handler
+	Logger            func(msg string, isErr bool)
+	ReadHeaderTimeout time.Duration
 }
 
 // New creates a new sever instance that can be started individually
@@ -41,15 +42,17 @@ func New(cfg Cfg) (*Server, error) {
 	s := Server{
 		logger: cfg.Logger,
 		server: http.Server{
-			Addr:    cfg.Addr,
-			Handler: cfg.Handler,
+			Addr:              cfg.Addr,
+			Handler:           cfg.Handler,
+			ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 		},
 	}
 
 	if !cfg.SkipObs {
 		s.obsServer = &http.Server{
-			Addr:    cfg.ObsAddr,
-			Handler: cfg.ObsHandler,
+			Addr:              cfg.ObsAddr,
+			Handler:           cfg.ObsHandler,
+			ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 		}
 	}
 	return &s, nil

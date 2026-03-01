@@ -17,7 +17,7 @@ func (t ReqDelay) Delay(next http.Handler) http.Handler {
 
 		if t.On && t.MinDelay.Milliseconds() != 0 && t.MaxDelay.Milliseconds() != 0 {
 			size := t.MaxDelay - t.MinDelay
-			randDur := rand.IntN(int(size))
+			randDur := rand.IntN(int(size)) //nolint:gosec // non-crypto randomness is sufficient for delay jitter
 			time.Sleep(time.Duration(randDur))
 		}
 		next.ServeHTTP(w, r)

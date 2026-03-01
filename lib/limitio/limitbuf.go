@@ -20,11 +20,11 @@ func (b *LimitedBuf) Reset() {
 
 func (b *LimitedBuf) Write(p []byte) (n int, err error) {
 	if len(p)+b.curByte > b.MaxBytes {
-		return 0, BufferLimitErr
+		return 0, ErrBufferLimit
 	}
 	n, err = b.Buffer.Write(p)
 	b.curByte += n
 	return n, err
 }
 
-var BufferLimitErr = fmt.Errorf("buffer write limit reached")
+var ErrBufferLimit = fmt.Errorf("buffer write limit reached")

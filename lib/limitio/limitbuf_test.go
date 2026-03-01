@@ -27,7 +27,7 @@ func TestBuffer_Write(t *testing.T) {
 			name:        "Write exceeds limit",
 			buffer:      &limitio.LimitedBuf{MaxBytes: 5},
 			data:        []byte("Hello, World!"),
-			expectedErr: limitio.BufferLimitErr,
+			expectedErr: limitio.ErrBufferLimit,
 			expectedN:   0,
 			expectedBuf: "",
 		},
@@ -44,7 +44,7 @@ func TestBuffer_Write(t *testing.T) {
 			buffer:      &limitio.LimitedBuf{MaxBytes: 5},
 			initialData: []byte("Hello"),
 			data:        []byte("World"),
-			expectedErr: limitio.BufferLimitErr,
+			expectedErr: limitio.ErrBufferLimit,
 			expectedN:   0,
 			expectedBuf: "Hello", // previous data
 		},
@@ -54,7 +54,7 @@ func TestBuffer_Write(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Reset the buffer before running each test
 			tc.buffer.Reset()
-			tc.buffer.Write(tc.initialData)
+			_, _ = tc.buffer.Write(tc.initialData)
 			n, err := tc.buffer.Write(tc.data)
 
 			if err != nil && err != tc.expectedErr {
