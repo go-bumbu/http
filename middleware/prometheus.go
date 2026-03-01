@@ -22,6 +22,7 @@ func (c *Middleware) observe(r *http.Request, statusCode int, dur time.Duration)
 	}
 }
 
+// Histogram ensures that when we call observe the request metric has been initialized correctly with NewPromHistogram
 type Histogram struct {
 	h *prometheus.HistogramVec
 }

@@ -20,6 +20,16 @@ func (c *Middleware) log(r *http.Request, statusCode int, errmsg string, dur tim
 			slog.String("req-id", r.Header.Get("Request-Id")),
 			slog.String("err-handlerMsg", errmsg),
 		)
+	} else if IsStatusError(statusCode) {
+		c.logger.Info("",
+			slog.String("method", r.Method),
+			slog.String("url", r.RequestURI),
+			slog.Duration("req-dur", dur),
+			slog.Int("response-code", statusCode),
+			slog.String("ip", userIp(r)),
+			slog.String("req-id", r.Header.Get("Request-Id")),
+			slog.String("err-handlerMsg", errmsg),
+		)
 	} else {
 		c.logger.Info("",
 			slog.String("method", r.Method),

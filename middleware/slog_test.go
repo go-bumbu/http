@@ -3,13 +3,14 @@ package middleware_test
 import (
 	"bytes"
 	"context"
-	"github.com/go-bumbu/http/middleware"
-	"github.com/google/go-cmp/cmp"
 	"io"
 	"log/slog"
 	"net/http/httptest"
 	"slices"
 	"testing"
+
+	"github.com/go-bumbu/http/middleware"
+	"github.com/google/go-cmp/cmp"
 )
 
 func TestSlogMiddleware(t *testing.T) {
@@ -32,7 +33,7 @@ func TestSlogMiddleware(t *testing.T) {
 			name:          "capture 4xx handlerMsg",
 			statusCode:    401,
 			handlerMsg:    "unauthorized",
-			expect:        "INFO method=GET url=/metrics response-code=401 req-id= ",
+			expect:        "INFO method=GET url=/metrics response-code=401 req-id= err-handlerMsg=unauthorized ",
 			expectPayload: "unauthorized",
 		},
 		{

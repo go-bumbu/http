@@ -14,14 +14,14 @@ type Cfg struct {
 	JsonErrors  bool
 	GenericErrs bool // print generic error messages instead of the actual one
 	Logger      *slog.Logger
-	Histogram   Histogram
+	PromHisto   Histogram
 }
 
 func New(cfg Cfg) *Middleware {
 	m := Middleware{
 		jsonErrors:  cfg.JsonErrors,
 		genericErrs: cfg.GenericErrs,
-		hist:        cfg.Histogram,
+		hist:        cfg.PromHisto,
 		logger:      cfg.Logger,
 	}
 	return &m
@@ -49,7 +49,10 @@ type Middleware struct {
 func (c *Middleware) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		timeStart := time.Now()
-		respWriter := NewWriter(w, true)
+		// teeOnErr: when we won't modify the body (no genericErrs, no jsonErrors), tee so the
+		// client receives it during e.g. reverse proxy copy—avoids indefinite hang on 401.
+		teeOnErr := !c.genericErrs && !c.jsonErrors
+		respWriter := NewWriter(w, true, teeOnErr)
 
 		next.ServeHTTP(respWriter, r)
 		timeDiff := time.Since(timeStart)
@@ -62,7 +65,9 @@ func (c *Middleware) Middleware(next http.Handler) http.Handler {
 			errMsg = http.StatusText(respWriter.StatusCode())
 		}
 
-		if respWriter.statusCode != 200 {
+		if respWriter.statusCode != 200 && !respWriter.BodyForwarded() {
+			// StatWriter did not tee (e.g. direct http.Error from handler): body was buffered only,
+			// so we must write it here or the client hangs waiting for Content-Length bytes.
 			if c.jsonErrors {
 				b := jsonErrBytes(errMsg, respWriter.StatusCode())
 				w.Header().Set("Content-Type", "application/json")
@@ -70,6 +75,9 @@ func (c *Middleware) Middleware(next http.Handler) http.Handler {
 			} else {
 				w.Header().Set("Content-Type", "text/plain")
 				_, _ = fmt.Fprint(w, errMsg)
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
 			}
 		}
 
