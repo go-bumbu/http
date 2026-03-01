@@ -62,7 +62,7 @@ func TestPromMiddleware(t *testing.T) {
 			m := middleware.New(middleware.Cfg{
 				JsonErrors: false,
 				Logger:     nil,
-				Histogram:  hist,
+				PromHisto:  hist,
 			})
 
 			promHandler := m.Middleware(testHandler(tc.statusCode, "ok"))

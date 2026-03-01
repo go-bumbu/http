@@ -2,9 +2,10 @@ package middleware
 
 import (
 	"bytes"
-	"github.com/go-bumbu/http/lib/limitio"
 	"net/http"
 	"strconv"
+
+	"github.com/go-bumbu/http/lib/limitio"
 )
 
 // StatWriter is a wrapper to a httpResponse writer that allows to intercept and
@@ -12,21 +13,24 @@ import (
 type StatWriter struct {
 	http.ResponseWriter
 	statusCode    int
-	interceptBody bool // write a limited amount of chars into a buffer in case a non 200 code
+	interceptBody bool // buffer body for non-200 responses
+	teeOnErr      bool // when true, also forward body to client (avoids hang on proxy copy)
 	buf           *limitio.LimitedBuf
-	headerWritten bool // only write header once
+	headerWritten bool
+	bodyForwarded bool // true when body was written to client (via tee)
 }
 
-// NewWriter will return a pointer to a response writer
-// if teeBodyOnErr is set to true, and in case of a non 200 status code,
-// the writer will not write the Response but instead into it's own buffer.
-// this allows to modify the response before writing it to the output
-func NewWriter(w http.ResponseWriter, teeBodyOnErr bool) *StatWriter {
-	// WriteHeader(int) is not called if the response is 200 (implicit response code) so it needs to be the default
+// NewWriter returns a StatWriter. When interceptBody is true and status != 200,
+// the body is buffered. If teeOnErr is also true, the body is also forwarded to
+// the client immediately (avoids hang when e.g. a reverse proxy copies the response).
+// When teeOnErr is false, only the buffer is written; the middleware must write
+// the body (e.g. when it will replace it with jsonErrors or genericErrs).
+func NewWriter(w http.ResponseWriter, interceptBody bool, teeOnErr bool) *StatWriter {
 	return &StatWriter{
 		ResponseWriter: w,
 		statusCode:     http.StatusOK,
-		interceptBody:  teeBodyOnErr,
+		interceptBody:  interceptBody,
+		teeOnErr:       teeOnErr,
 		buf: &limitio.LimitedBuf{
 			Buffer:   bytes.Buffer{},
 			MaxBytes: 2000,
@@ -42,12 +46,31 @@ func (r *StatWriter) StatusCodeStr() string {
 	return strconv.Itoa(r.statusCode)
 }
 
-// Write returns underlying Write result, while counting data size
+// Write returns underlying Write result.
+// For non-200 when interceptBody is true: always buffers for logging.
+// When teeOnErr is true, also forwards to client (so proxy copy completes; avoids hang).
+// When teeOnErr is false, buffers only (middleware will write, possibly modified).
 func (r *StatWriter) Write(b []byte) (int, error) {
 	if r.interceptBody && r.statusCode != 200 {
-		return r.buf.Write(b)
+		if n, err := r.buf.Write(b); err != nil {
+			return n, err
+		}
+		if r.teeOnErr {
+			n, err := r.ResponseWriter.Write(b)
+			if n > 0 {
+				r.bodyForwarded = true
+			}
+			return n, err
+		}
+		return len(b), nil
 	}
 	return r.ResponseWriter.Write(b)
+}
+
+// BodyForwarded returns true if the response body was already written to the client
+// (e.g. via tee during a proxy copy). The middleware uses this to avoid writing twice.
+func (r *StatWriter) BodyForwarded() bool {
+	return r.bodyForwarded
 }
 
 // WriteHeader writes the response status code and stores it internally
