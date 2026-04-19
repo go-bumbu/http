@@ -1,11 +1,32 @@
 package middleware
 
 import (
-	"github.com/prometheus/client_golang/prometheus"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
+
+// Metrics returns a standalone middleware that records Prometheus request duration metrics.
+func Metrics(hist Histogram) func(http.Handler) http.Handler {
+	if hist.h == nil {
+		return func(next http.Handler) http.Handler { return next }
+	}
+	m := &Middleware{hist: hist}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			timeStart := time.Now()
+			respWriter := NewWriter(w, false, false)
+
+			next.ServeHTTP(respWriter, r)
+			timeDiff := time.Since(timeStart)
+
+			m.observe(r, respWriter.StatusCode(), timeDiff)
+		})
+	}
+}
 
 func (c *Middleware) observe(r *http.Request, statusCode int, dur time.Duration) {
 	if c.hist.h != nil {
@@ -27,7 +48,7 @@ type Histogram struct {
 	h *prometheus.HistogramVec
 }
 
-func NewPromHistogram(prefix string, buckets []float64, registry prometheus.Registerer) Histogram {
+func NewPromHistogram(prefix string, buckets []float64, registry prometheus.Registerer) (Histogram, error) {
 	if registry == nil {
 		registry = prometheus.DefaultRegisterer
 	}
@@ -55,9 +76,11 @@ func NewPromHistogram(prefix string, buckets []float64, registry prometheus.Regi
 			"isError",
 		},
 	)
-	registry.MustRegister(histogram)
+	if err := registry.Register(histogram); err != nil {
+		return Histogram{}, fmt.Errorf("registering prometheus histogram: %w", err)
+	}
 
 	return Histogram{
 		h: histogram,
-	}
+	}, nil
 }

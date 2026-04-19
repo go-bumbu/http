@@ -20,8 +20,29 @@ license-check: ## check for invalid licenses
 	# depends on : https://github.com/elastic/go-licence-detector
 	@go list -m -mod=readonly  -json all  | go-licence-detector -includeIndirect -validate -rules allowedLicenses.json
 
+
+COVERAGE_THRESHOLD ?= 70
+.PHONY: coverage
+coverage:
+	@fail=0; \
+	for pkg in $$(go list ./lib/... ./middleware/... ./handlers/...); do \
+		go test -coverprofile=coverage.out -covermode=atomic $$pkg > /dev/null 2>&1; \
+		if [ -f coverage.out ]; then \
+			coverage=$$(go tool cover -func=coverage.out | grep total: | awk '{print $$3}' | sed 's/%//'); \
+			if [ $$(echo "$$coverage < $(COVERAGE_THRESHOLD)" | bc -l) -eq 1 ]; then \
+				echo "❌ Coverage in $$pkg is below $(COVERAGE_THRESHOLD)%: $${coverage}%"; \
+				fail=1; \
+			fi; \
+			rm -f coverage.out; \
+		else \
+			echo "⚠️ No coverage data for $$pkg"; \
+			fail=1; \
+		fi; \
+	done; \
+	exit $$fail
+
 .PHONY: verify
-verify: test license-check lint benchmark ## run all tests
+verify: test license-check lint benchmark coverage ## run all tests
 
 cover-report: ## generate a coverage report
 	go test -covermode=count -coverpkg=./... -coverprofile cover.out  ./...

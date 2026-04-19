@@ -1,48 +1,53 @@
 package middleware
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"time"
+
+	"github.com/go-bumbu/http/lib/limitio"
 )
 
 type Cfg struct {
-	JsonErrors  bool
-	GenericErrs bool // print generic error messages instead of the actual one
-	Logger      *slog.Logger
-	PromHisto   Histogram
+	JsonErrors   bool
+	GenericErrs  bool // print generic error messages instead of the actual one
+	PanicRecover bool
+	Logger       *slog.Logger
+	PromHisto    Histogram
 }
 
 func New(cfg Cfg) *Middleware {
 	m := Middleware{
-		jsonErrors:  cfg.JsonErrors,
-		genericErrs: cfg.GenericErrs,
-		hist:        cfg.PromHisto,
-		logger:      cfg.Logger,
+		jsonErrors:   cfg.JsonErrors,
+		genericErrs:  cfg.GenericErrs,
+		panicRecover: cfg.PanicRecover,
+		hist:         cfg.PromHisto,
+		logger:       cfg.Logger,
 	}
 	return &m
 }
 
 // Middleware is intended perform common actions done by a production http server, it has several configuration flags:
-//   - JsonErrors: if set to true it will intercept all responses != 200, read the response error handlerMsg and
-//     wrap it into a json file, this is useful for APIs
+//   - JsonErrors: if set to true it will intercept all error responses (status < 200 or >= 400), read the response
+//     error handlerMsg and wrap it into a json file, this is useful for APIs
 //   - GenericErrs: if set to true the error handlerMsg responded to the en user is a generic handlerMsg based on the
 //     response code instead of the original error handlerMsg, the original error will still be logged.
 //
-// NOTE: both JsonErrors and GenericErrs assumes that only 200 response codes contain usable body, e.g. don't
-// return html in case of errors
+// NOTE: both JsonErrors and GenericErrs only intercept error responses (< 200 or >= 400). Success codes like
+// 200, 204, 206 etc. pass through unmodified.
 //
 //   - Histogram: use NewPromHistogram to create an histogram used to capture prometheus metrics about every request
 //     if left empty, no prometheus metric will be captured
 type Middleware struct {
-	jsonErrors  bool
-	genericErrs bool
-	hist        Histogram
-	logger      *slog.Logger
+	jsonErrors   bool
+	genericErrs  bool
+	panicRecover bool
+	hist         Histogram
+	logger       *slog.Logger
 }
 
 // Middleware is an HTTP middleware that checks the Config and applies logic based on it.
@@ -54,64 +59,77 @@ func (c *Middleware) Middleware(next http.Handler) http.Handler {
 		teeOnErr := !c.genericErrs && !c.jsonErrors
 		respWriter := NewWriter(w, true, teeOnErr)
 
+		if c.panicRecover {
+			defer func() {
+				if rec := recover(); rec != nil {
+					stack := debug.Stack()
+					if c.logger != nil {
+						c.logger.Error("panic recovered",
+							slog.String("method", r.Method),
+							slog.String("url", r.RequestURI),
+							slog.String("panic", fmt.Sprint(rec)),
+							slog.String("stack", string(stack)),
+						)
+					}
+					respWriter.WriteHeader(http.StatusInternalServerError)
+					_, _ = respWriter.Write([]byte(http.StatusText(http.StatusInternalServerError)))
+				}
+				c.finalize(w, r, respWriter, timeStart)
+			}()
+		}
+
 		next.ServeHTTP(respWriter, r)
-		timeDiff := time.Since(timeStart)
 
-		// get the generic or the specific error string
-		errMsg := c.getErrMsg(respWriter.statusCode, respWriter.buf)
-		c.log(r, respWriter.StatusCode(), errMsg, timeDiff)
-
-		if c.genericErrs {
-			errMsg = http.StatusText(respWriter.StatusCode())
+		if !c.panicRecover {
+			c.finalize(w, r, respWriter, timeStart)
 		}
-
-		if respWriter.statusCode != 200 && !respWriter.BodyForwarded() {
-			// StatWriter did not tee (e.g. direct http.Error from handler): body was buffered only,
-			// so we must write it here or the client hangs waiting for Content-Length bytes.
-			if c.jsonErrors {
-				b := jsonErrBytes(errMsg, respWriter.StatusCode())
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = fmt.Fprint(w, string(b))
-			} else {
-				w.Header().Set("Content-Type", "text/plain")
-				_, _ = fmt.Fprint(w, errMsg)
-			}
-			if flusher, ok := w.(http.Flusher); ok {
-				flusher.Flush()
-			}
-		}
-
-		c.observe(r, respWriter.StatusCode(), timeDiff)
 	})
 }
 
-// getErrMsg returns the error handlerMsg in case of a request != 200 or empty string
-func (c *Middleware) getErrMsg(code int, buf io.Reader) string {
-	if code == 200 {
+func (c *Middleware) finalize(w http.ResponseWriter, r *http.Request, respWriter *StatWriter, timeStart time.Time) {
+	timeDiff := time.Since(timeStart)
+
+	errMsg := c.getErrMsg(respWriter.statusCode, respWriter.buf)
+	c.log(r, respWriter.StatusCode(), errMsg, timeDiff)
+
+	if c.genericErrs {
+		errMsg = http.StatusText(respWriter.StatusCode())
+	}
+
+	if IsStatusError(respWriter.statusCode) && !respWriter.BodyForwarded() {
+		if c.jsonErrors {
+			b := jsonErrBytes(errMsg, respWriter.StatusCode())
+			w.Header().Set("Content-Type", "application/json")
+			respWriter.flushHeader()
+			_, _ = w.Write(b)
+		} else {
+			w.Header().Set("Content-Type", "text/plain")
+			respWriter.flushHeader()
+			_, _ = fmt.Fprint(w, errMsg)
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	} else {
+		respWriter.flushHeader()
+	}
+
+	c.observe(r, respWriter.StatusCode(), timeDiff)
+}
+
+// getErrMsg returns the error handlerMsg in case of an error response or empty string
+func (c *Middleware) getErrMsg(code int, buf *limitio.LimitedBuf) string {
+	if !IsStatusError(code) {
 		return ""
 	}
 
 	msgB, err := io.ReadAll(buf)
 	if err != nil && c.logger != nil {
-		// I wish I could estimate the conditions of this error
 		c.logger.Error("error while reading buffer error handlerMsg:", slog.Any("err", err))
 	}
-	return strings.Trim(string(msgB), "\n")
-}
-
-type jsonErr struct {
-	Error string `json:"error"`
-	Code  int    `json:"code"`
-}
-
-func jsonErrBytes(error string, code int) []byte {
-	if code == 0 {
-		code = http.StatusInternalServerError
+	msg := strings.Trim(string(msgB), "\n")
+	if buf.Truncated() {
+		msg += " [truncated]"
 	}
-	payload := jsonErr{
-		Error: error,
-		Code:  code,
-	}
-	byteErr, _ := json.Marshal(payload)
-	return byteErr
+	return msg
 }
