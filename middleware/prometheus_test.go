@@ -57,7 +57,10 @@ func TestPromMiddleware(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 
 			reg := prometheus.NewRegistry()
-			hist := middleware.NewPromHistogram(tc.metricPrefix, nil, reg)
+			hist, err := middleware.NewPromHistogram(tc.metricPrefix, nil, reg)
+			if err != nil {
+				t.Fatalf("failed to create histogram: %v", err)
+			}
 
 			m := middleware.New(middleware.Cfg{
 				JsonErrors: false,
