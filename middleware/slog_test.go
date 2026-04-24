@@ -86,12 +86,16 @@ func TestSlogMiddleware(t *testing.T) {
 }
 
 // InMemoryHandler is a custom slog.Handler implementation that writes logs to an in-memory buffer.
+// minLevel gates records; group (set via WithGroup) is used to prefix attr keys so tests can
+// assert on flat "group.key=value" strings for grouped attributes emitted by the middleware.
 type InMemoryHandler struct {
-	Buffer *bytes.Buffer
+	Buffer   *bytes.Buffer
+	minLevel slog.Level
+	group    string
 }
 
-func (h *InMemoryHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	return true
+func (h *InMemoryHandler) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= h.minLevel
 }
 
 // slog attributes that will be skipped in the test
@@ -105,9 +109,7 @@ func (h *InMemoryHandler) Handle(_ context.Context, r slog.Record) error {
 	logMsg.WriteString(r.Level.String())
 	logMsg.WriteString(" ")
 	r.Attrs(func(attr slog.Attr) bool {
-		if !slices.Contains(skipAttr, attr.Key) {
-			logMsg.WriteString(attr.Key + "=" + attr.Value.String() + " ")
-		}
+		writeAttr(&logMsg, "", attr)
 		return true
 	})
 	logMsg.WriteString(r.Message)
@@ -115,12 +117,36 @@ func (h *InMemoryHandler) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 
-func (h *InMemoryHandler) WithAttrs(attrs []slog.Attr) slog.Handler { return h }
-func (h *InMemoryHandler) WithGroup(name string) slog.Handler       { return h }
+// writeAttr renders an attr, recursing into groups so a grouped attr like
+// slog.Group("req-headers", slog.String("Authorization", "[REDACTED]")) becomes
+// "req-headers.Authorization=[REDACTED] " in the buffer.
+func writeAttr(buf *bytes.Buffer, prefix string, attr slog.Attr) {
+	if slices.Contains(skipAttr, attr.Key) {
+		return
+	}
+	key := attr.Key
+	if prefix != "" {
+		key = prefix + "." + key
+	}
+	if attr.Value.Kind() == slog.KindGroup {
+		for _, sub := range attr.Value.Group() {
+			writeAttr(buf, key, sub)
+		}
+		return
+	}
+	buf.WriteString(key + "=" + attr.Value.String() + " ")
+}
+
+func (h *InMemoryHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+func (h *InMemoryHandler) WithGroup(name string) slog.Handler   { return h }
 
 func newMemSlog() (*bytes.Buffer, *slog.Logger) {
+	return newMemSlogLevel(slog.LevelDebug)
+}
+
+func newMemSlogLevel(min slog.Level) (*bytes.Buffer, *slog.Logger) {
 	buffer := &bytes.Buffer{}
-	handler := &InMemoryHandler{Buffer: buffer}
+	handler := &InMemoryHandler{Buffer: buffer, minLevel: min}
 	logger := slog.New(handler)
 	return buffer, logger
 }
