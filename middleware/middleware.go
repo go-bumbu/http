@@ -18,15 +18,35 @@ type Cfg struct {
 	PanicRecover bool
 	Logger       *slog.Logger
 	PromHisto    Histogram
+
+	// LogHeaders, when true, causes the middleware to emit one additional
+	// log record per request at slog.LevelDebug containing request and
+	// response headers. The record is only emitted when the configured
+	// slog.Logger is enabled for LevelDebug.
+	LogHeaders bool
+
+	// ExtraRedactHeaders lists additional header names whose values are
+	// replaced with "[REDACTED]" in the debug header log. Matching is
+	// case-insensitive against canonicalised header keys and is appended
+	// to the built-in default list. Ignored when DisableRedaction is true.
+	ExtraRedactHeaders []string
+
+	// DisableRedaction, when true, logs header values verbatim. The
+	// built-in redact list and ExtraRedactHeaders are both ignored.
+	// Intended for local debugging only.
+	DisableRedaction bool
 }
 
 func New(cfg Cfg) *Middleware {
 	m := Middleware{
-		jsonErrors:   cfg.JsonErrors,
-		genericErrs:  cfg.GenericErrs,
-		panicRecover: cfg.PanicRecover,
-		hist:         cfg.PromHisto,
-		logger:       cfg.Logger,
+		jsonErrors:       cfg.JsonErrors,
+		genericErrs:      cfg.GenericErrs,
+		panicRecover:     cfg.PanicRecover,
+		hist:             cfg.PromHisto,
+		logger:           cfg.Logger,
+		logHeaders:       cfg.LogHeaders,
+		disableRedaction: cfg.DisableRedaction,
+		redact:           newRedactSet(cfg.ExtraRedactHeaders),
 	}
 	return &m
 }
@@ -43,11 +63,14 @@ func New(cfg Cfg) *Middleware {
 //   - Histogram: use NewPromHistogram to create an histogram used to capture prometheus metrics about every request
 //     if left empty, no prometheus metric will be captured
 type Middleware struct {
-	jsonErrors   bool
-	genericErrs  bool
-	panicRecover bool
-	hist         Histogram
-	logger       *slog.Logger
+	jsonErrors       bool
+	genericErrs      bool
+	panicRecover     bool
+	hist             Histogram
+	logger           *slog.Logger
+	logHeaders       bool
+	disableRedaction bool
+	redact           redactSet
 }
 
 // Middleware is an HTTP middleware that checks the Config and applies logic based on it.
@@ -91,6 +114,7 @@ func (c *Middleware) finalize(w http.ResponseWriter, r *http.Request, respWriter
 
 	errMsg := c.getErrMsg(respWriter.statusCode, respWriter.buf)
 	c.log(r, respWriter.StatusCode(), errMsg, timeDiff)
+	c.logHeadersDebug(r, respWriter.Header())
 
 	if c.genericErrs {
 		errMsg = http.StatusText(respWriter.StatusCode())

@@ -5,8 +5,10 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/go-bumbu/http/middleware"
@@ -86,12 +88,11 @@ func TestSlogMiddleware(t *testing.T) {
 }
 
 // InMemoryHandler is a custom slog.Handler implementation that writes logs to an in-memory buffer.
-// minLevel gates records; group (set via WithGroup) is used to prefix attr keys so tests can
-// assert on flat "group.key=value" strings for grouped attributes emitted by the middleware.
+// minLevel gates records and writeAttr flattens grouped attrs into "group.key=value" form so
+// tests can assert on grouped attributes emitted by the middleware.
 type InMemoryHandler struct {
 	Buffer   *bytes.Buffer
 	minLevel slog.Level
-	group    string
 }
 
 func (h *InMemoryHandler) Enabled(_ context.Context, level slog.Level) bool {
@@ -159,5 +160,135 @@ func TestMemoryHandler(t *testing.T) {
 	expected := "INFO key=value test handlerMsg"
 	if !bytes.Contains(buf.Bytes(), []byte(expected)) {
 		t.Errorf("expected log to contain: %q, got: %q", expected, buf.String())
+	}
+}
+
+// testHandlerWithRespHeaders writes a fixed response header before returning 200
+// so tests can assert on resp-headers in the debug log line.
+func testHandlerWithRespHeaders(body string, respHeaders map[string]string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		for k, v := range respHeaders {
+			w.Header().Set(k, v)
+		}
+		_, _ = w.Write([]byte(body))
+	})
+}
+
+func TestLogHeaders(t *testing.T) {
+	tcs := []struct {
+		name               string
+		logHeaders         bool
+		extraRedact        []string
+		disableRedaction   bool
+		reqHeaders         map[string][]string
+		respHeaders        map[string]string
+		mustContain        []string
+		mustNotContain     []string
+	}{
+		{
+			name:           "disabled by default — no debug line",
+			logHeaders:     false,
+			reqHeaders:     map[string][]string{"Authorization": {"Bearer abc"}},
+			mustNotContain: []string{"DEBUG", "req-headers", "resp-headers"},
+		},
+		{
+			name:       "enabled — redacts Authorization, keeps Content-Type, logs resp headers",
+			logHeaders: true,
+			reqHeaders: map[string][]string{
+				"Authorization": {"Bearer abc"},
+				"Content-Type":  {"application/json"},
+			},
+			respHeaders: map[string]string{"X-Trace-Id": "t-1"},
+			mustContain: []string{
+				"DEBUG",
+				"req-headers.Authorization=[REDACTED]",
+				"req-headers.Content-Type=application/json",
+				"resp-headers.X-Trace-Id=t-1",
+			},
+			mustNotContain: []string{"Bearer abc"},
+		},
+		{
+			name:        "ExtraRedactHeaders — case-insensitive match on added header",
+			logHeaders:  true,
+			extraRedact: []string{"x-tenant-secret"},
+			reqHeaders:  map[string][]string{"X-Tenant-Secret": {"super-secret"}},
+			mustContain: []string{"req-headers.X-Tenant-Secret=[REDACTED]"},
+			mustNotContain: []string{"super-secret"},
+		},
+		{
+			name:             "DisableRedaction — Authorization printed verbatim",
+			logHeaders:       true,
+			disableRedaction: true,
+			reqHeaders:       map[string][]string{"Authorization": {"Bearer abc"}},
+			mustContain:      []string{"req-headers.Authorization=Bearer abc"},
+			mustNotContain:   []string{"[REDACTED]"},
+		},
+		{
+			name:       "multi-value Cookie still redacted; multi-value non-sensitive joined with comma-space",
+			logHeaders: true,
+			reqHeaders: map[string][]string{
+				"Cookie":          {"a=1", "b=2"},
+				"Accept-Encoding": {"gzip", "deflate"},
+			},
+			mustContain: []string{
+				"req-headers.Cookie=[REDACTED]",
+				"req-headers.Accept-Encoding=gzip, deflate",
+			},
+			mustNotContain: []string{"a=1", "b=2"},
+		},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, logger := newMemSlog()
+			th := testHandlerWithRespHeaders("ok", tc.respHeaders)
+
+			m := middleware.New(middleware.Cfg{
+				Logger:             logger,
+				LogHeaders:         tc.logHeaders,
+				ExtraRedactHeaders: tc.extraRedact,
+				DisableRedaction:   tc.disableRedaction,
+			})
+
+			handler := m.Middleware(th)
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/", nil)
+			for k, vs := range tc.reqHeaders {
+				for _, v := range vs {
+					req.Header.Add(k, v)
+				}
+			}
+			handler.ServeHTTP(rec, req)
+
+			got := buf.String()
+			for _, want := range tc.mustContain {
+				if !strings.Contains(got, want) {
+					t.Errorf("log missing %q\nfull log:\n%s", want, got)
+				}
+			}
+			for _, avoid := range tc.mustNotContain {
+				if strings.Contains(got, avoid) {
+					t.Errorf("log unexpectedly contained %q\nfull log:\n%s", avoid, got)
+				}
+			}
+		})
+	}
+}
+
+func TestLogHeaders_LoggerNotDebugEnabled(t *testing.T) {
+	buf, logger := newMemSlogLevel(slog.LevelInfo)
+	th := testHandlerWithRespHeaders("ok", nil)
+
+	m := middleware.New(middleware.Cfg{Logger: logger, LogHeaders: true})
+	handler := m.Middleware(th)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("Authorization", "Bearer abc")
+	handler.ServeHTTP(rec, req)
+
+	got := buf.String()
+	if strings.Contains(got, "DEBUG") || strings.Contains(got, "req-headers") {
+		t.Errorf("expected no debug record when logger debug-disabled, got:\n%s", got)
 	}
 }
