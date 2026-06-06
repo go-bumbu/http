@@ -140,6 +140,55 @@ func TestStatWriter_DeferredHeader(t *testing.T) {
 	}
 }
 
+// countingRW mimics net/http's behaviour of implicitly calling WriteHeader(200)
+// on the first Write, and counts how many times WriteHeader reaches the writer.
+// httptest.ResponseRecorder cannot be used here because it does not surface the
+// duplicate-WriteHeader condition that the real net/http server logs as
+// "superfluous response.WriteHeader call".
+type countingRW struct {
+	header           http.Header
+	writeHeaderCalls int
+	wroteHeader      bool
+}
+
+func (c *countingRW) Header() http.Header {
+	if c.header == nil {
+		c.header = http.Header{}
+	}
+	return c.header
+}
+
+func (c *countingRW) WriteHeader(int) {
+	c.writeHeaderCalls++
+	c.wroteHeader = true
+}
+
+func (c *countingRW) Write(b []byte) (int, error) {
+	if !c.wroteHeader {
+		c.WriteHeader(http.StatusOK)
+	}
+	return len(b), nil
+}
+
+// TestStatWriter_NoSuperfluousWriteHeader guards against a regression where a
+// successful handler that writes a body without an explicit WriteHeader caused
+// flushHeader to issue a second WriteHeader on the underlying writer (logged by
+// net/http as "superfluous response.WriteHeader call"). The implicit header
+// commit during Write must be recorded so flushHeader becomes a no-op.
+func TestStatWriter_NoSuperfluousWriteHeader(t *testing.T) {
+	crw := &countingRW{}
+	sw := NewWriter(crw, true, true) // matches the Logging middleware config
+
+	// Success handler: writes body without an explicit WriteHeader call.
+	_, _ = sw.Write([]byte("hello"))
+	// Logging middleware flushes the header after the handler returns.
+	sw.flushHeader()
+
+	if crw.writeHeaderCalls != 1 {
+		t.Errorf("expected exactly 1 WriteHeader call, got %d (superfluous call)", crw.writeHeaderCalls)
+	}
+}
+
 func TestStatWriter_Unwrap(t *testing.T) {
 	rec := httptest.NewRecorder()
 	sw := NewWriter(rec, false, false)
