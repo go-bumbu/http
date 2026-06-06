@@ -59,10 +59,16 @@ func (r *StatWriter) Write(b []byte) (int, error) {
 			if n > 0 {
 				r.bodyForwarded = true
 			}
+			// The underlying Write implicitly committed the header; record it so
+			// flushHeader does not issue a superfluous WriteHeader call.
+			r.headerWritten = true
 			return n, err
 		}
 		return len(b), nil
 	}
+	// The underlying Write implicitly commits the header (WriteHeader(200) if not
+	// already written); record it so flushHeader does not write the header twice.
+	r.headerWritten = true
 	return r.ResponseWriter.Write(b)
 }
 
