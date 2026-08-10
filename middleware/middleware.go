@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -52,13 +53,15 @@ func New(cfg Cfg) *Middleware {
 }
 
 // Middleware is intended perform common actions done by a production http server, it has several configuration flags:
-//   - JsonErrors: if set to true it will intercept all error responses (status < 200 or >= 400), read the response
-//     error handlerMsg and wrap it into a json file, this is useful for APIs
+//   - JsonErrors: if set to true it will intercept all error responses (status >= 400, see IsStatusError),
+//     read the response error handlerMsg and wrap it into a json file, this is useful for APIs
 //   - GenericErrs: if set to true the error handlerMsg responded to the en user is a generic handlerMsg based on the
 //     response code instead of the original error handlerMsg, the original error will still be logged.
 //
-// NOTE: both JsonErrors and GenericErrs only intercept error responses (< 200 or >= 400). Success codes like
-// 200, 204, 206 etc. pass through unmodified.
+// NOTE: both JsonErrors and GenericErrs only intercept error responses (>= 400). Success codes like
+// 200, 204, 206 etc. pass through unmodified, as do 1xx informational responses.
+// Handlers that stream (flush before the response is complete) or hijack the connection
+// are never modified.
 //
 //   - Histogram: use NewPromHistogram to create an histogram used to capture prometheus metrics about every request
 //     if left empty, no prometheus metric will be captured
@@ -85,31 +88,59 @@ func (c *Middleware) Middleware(next http.Handler) http.Handler {
 		if c.panicRecover {
 			defer func() {
 				if rec := recover(); rec != nil {
-					stack := debug.Stack()
-					if c.logger != nil {
-						c.logger.Error("panic recovered",
-							slog.String("method", r.Method),
-							slog.String("url", r.RequestURI),
-							slog.String("panic", fmt.Sprint(rec)),
-							slog.String("stack", string(stack)),
-						)
+					if isAbort(rec) {
+						// net/http's sentinel to abort the response so the client
+						// sees a truncated reply (ReverseProxy panics with it when
+						// the upstream dies mid-copy). Swallowing it would make the
+						// truncated response look complete; hand it back to net/http.
+						c.observe(r, respWriter.StatusCode(), time.Since(timeStart))
+						panic(rec)
 					}
-					respWriter.WriteHeader(http.StatusInternalServerError)
-					_, _ = respWriter.Write([]byte(http.StatusText(http.StatusInternalServerError)))
+					c.handlePanic(r, respWriter, rec, debug.Stack())
 				}
-				c.finalize(w, r, respWriter, timeStart)
+				c.finalize(r, respWriter, timeStart)
 			}()
 		}
 
 		next.ServeHTTP(respWriter, r)
 
 		if !c.panicRecover {
-			c.finalize(w, r, respWriter, timeStart)
+			c.finalize(r, respWriter, timeStart)
 		}
 	})
 }
 
-func (c *Middleware) finalize(w http.ResponseWriter, r *http.Request, respWriter *StatWriter, timeStart time.Time) {
+// isAbort reports whether a recovered panic value is http.ErrAbortHandler, the stdlib
+// sentinel that means "abort this response, let the client detect the truncation".
+func isAbort(rec any) bool {
+	err, ok := rec.(error)
+	return ok && errors.Is(err, http.ErrAbortHandler)
+}
+
+// handlePanic logs a recovered panic and, when the response has not started streaming,
+// turns it into a 500 response. http.ErrAbortHandler must not reach here (see isAbort):
+// it is the stdlib's sentinel for deliberately aborting the response so the client
+// detects truncation; recovering it would make a truncated reply look complete.
+func (c *Middleware) handlePanic(r *http.Request, respWriter *StatWriter, rec any, stack []byte) {
+	if c.logger != nil {
+		c.logger.Error("panic recovered",
+			slog.String("method", r.Method),
+			slog.String("url", r.RequestURI),
+			slog.String("panic", fmt.Sprint(rec)),
+			slog.String("stack", string(stack)),
+		)
+	}
+	// Only synthesise a 500 when the response is still ours to write: after a hijack or
+	// a flush the client already has bytes, and appending an error body would corrupt
+	// the stream.
+	if respWriter.Streaming() {
+		return
+	}
+	respWriter.WriteHeader(http.StatusInternalServerError)
+	_, _ = respWriter.Write([]byte(http.StatusText(http.StatusInternalServerError)))
+}
+
+func (c *Middleware) finalize(r *http.Request, respWriter *StatWriter, timeStart time.Time) {
 	timeDiff := time.Since(timeStart)
 
 	errMsg := c.getErrMsg(respWriter.statusCode, respWriter.buf)
@@ -120,19 +151,12 @@ func (c *Middleware) finalize(w http.ResponseWriter, r *http.Request, respWriter
 		errMsg = http.StatusText(respWriter.StatusCode())
 	}
 
-	if IsStatusError(respWriter.statusCode) && !respWriter.BodyForwarded() {
+	if respWriter.canReplaceBody() {
 		if c.jsonErrors {
 			b := jsonErrBytes(errMsg, respWriter.StatusCode())
-			w.Header().Set("Content-Type", "application/json")
-			respWriter.flushHeader()
-			_, _ = w.Write(b)
+			writeReplacementBody(respWriter, "application/json", b)
 		} else {
-			w.Header().Set("Content-Type", "text/plain")
-			respWriter.flushHeader()
-			_, _ = fmt.Fprint(w, errMsg)
-		}
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
+			writeReplacementBody(respWriter, "text/plain", []byte(errMsg))
 		}
 	} else {
 		respWriter.flushHeader()

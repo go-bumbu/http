@@ -14,6 +14,11 @@ func PanicRecover(logger *slog.Logger) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
 				if rec := recover(); rec != nil {
+					if isAbort(rec) {
+						// net/http's sentinel for a deliberately aborted response;
+						// recovering it would hide the truncation from the client.
+						panic(rec)
+					}
 					stack := debug.Stack()
 					if logger != nil {
 						logger.Error("panic recovered",
