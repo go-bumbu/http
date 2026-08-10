@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 )
 
 // JSONErrors returns a standalone middleware that intercepts error responses (>= 400)
@@ -15,18 +16,13 @@ func JSONErrors(genericErrs bool) func(http.Handler) http.Handler {
 
 			next.ServeHTTP(respWriter, r)
 
-			if IsStatusError(respWriter.statusCode) && !respWriter.BodyForwarded() {
+			if respWriter.canReplaceBody() {
 				errMsg := readErrMsg(respWriter)
 				if genericErrs {
 					errMsg = http.StatusText(respWriter.StatusCode())
 				}
 				b := jsonErrBytes(errMsg, respWriter.StatusCode())
-				w.Header().Set("Content-Type", "application/json")
-				respWriter.flushHeader()
-				_, _ = w.Write(b)
-				if flusher, ok := w.(http.Flusher); ok {
-					flusher.Flush()
-				}
+				writeReplacementBody(respWriter, "application/json", b)
 			} else {
 				respWriter.flushHeader()
 			}
@@ -43,19 +39,34 @@ func GenericErrors() func(http.Handler) http.Handler {
 
 			next.ServeHTTP(respWriter, r)
 
-			if IsStatusError(respWriter.statusCode) && !respWriter.BodyForwarded() {
+			if respWriter.canReplaceBody() {
 				errMsg := http.StatusText(respWriter.StatusCode())
-				w.Header().Set("Content-Type", "text/plain")
-				respWriter.flushHeader()
-				_, _ = fmt.Fprint(w, errMsg)
-				if flusher, ok := w.(http.Flusher); ok {
-					flusher.Flush()
-				}
+				writeReplacementBody(respWriter, "text/plain", []byte(errMsg))
 			} else {
 				respWriter.flushHeader()
 			}
 		})
 	}
+}
+
+// writeReplacementBody writes body as the response, replacing whatever the handler
+// produced. Headers describing the original body would now be wrong and are corrected:
+// a stale Content-Length makes clients fail the read with "unexpected EOF" (the exact
+// reverse-proxy case: upstream error pages carry a Content-Length), and a stale
+// Content-Encoding would make clients try to decode a body that is no longer encoded.
+func writeReplacementBody(respWriter *StatWriter, contentType string, body []byte) {
+	h := respWriter.Header()
+	h.Set("Content-Type", contentType)
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	h.Del("Content-Encoding")
+	respWriter.flushHeader()
+	_, _ = respWriter.ResponseWriter.Write(body)
+	_ = flushIgnoreErr(respWriter.ResponseWriter)
+}
+
+// flushIgnoreErr flushes w if it (or anything it unwraps to) supports flushing.
+func flushIgnoreErr(w http.ResponseWriter) error {
+	return http.NewResponseController(w).Flush()
 }
 
 func readErrMsg(respWriter *StatWriter) string {

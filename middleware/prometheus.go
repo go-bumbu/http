@@ -32,15 +32,26 @@ func (c *Middleware) observe(r *http.Request, statusCode int, dur time.Duration)
 	if c.hist.h != nil {
 		isErrorStr := strconv.FormatBool(IsStatusError(statusCode))
 
-		// todo don't print all paths, this creates too much cardinality
 		c.hist.h.With(prometheus.Labels{
 			"type":    r.Proto,
 			"status":  strconv.Itoa(statusCode),
 			"method":  r.Method,
-			"addr":    r.URL.Path,
+			"addr":    metricAddr(r),
 			"isError": isErrorStr,
 		}).Observe(dur.Seconds())
 	}
+}
+
+// metricAddr returns the value for the "addr" metric label. The matched route pattern
+// (e.g. "/users/{id}") is preferred over the raw path: raw paths with parameters create
+// one time series per distinct URL, which grows Prometheus memory unboundedly. The raw
+// path is used only as fallback when the handler is not routed through a pattern-aware
+// http.ServeMux.
+func metricAddr(r *http.Request) string {
+	if r.Pattern != "" {
+		return r.Pattern
+	}
+	return r.URL.Path
 }
 
 // Histogram ensures that when we call observe the request metric has been initialized correctly with NewPromHistogram

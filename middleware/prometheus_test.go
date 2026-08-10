@@ -91,3 +91,37 @@ func TestPromMiddleware(t *testing.T) {
 		})
 	}
 }
+
+// TestPromMiddleware_PatternLabel verifies that when the handler is routed through a
+// pattern-aware http.ServeMux, the "addr" label uses the route pattern instead of the raw
+// path — one time series per route, not one per distinct URL (cardinality explosion).
+func TestPromMiddleware_PatternLabel(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	hist, err := middleware.NewPromHistogram("", nil, reg)
+	if err != nil {
+		t.Fatalf("failed to create histogram: %v", err)
+	}
+	m := middleware.New(middleware.Cfg{PromHisto: hist})
+
+	mux := http.NewServeMux()
+	mux.Handle("GET /users/{id}", testHandler(200, "ok"))
+
+	h := m.Middleware(mux)
+	for _, id := range []string{"1", "2", "3"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/users/"+id, nil))
+	}
+
+	rec := httptest.NewRecorder()
+	promhttp.HandlerFor(reg, promhttp.HandlerOpts{}).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body, _ := io.ReadAll(rec.Result().Body)
+	respBody := string(body)
+
+	want := `requests_http_duration_seconds_count{addr="GET /users/{id}",isError="false",method="GET",status="200",type="HTTP/1.1"} 3`
+	if !strings.Contains(respBody, want) {
+		t.Errorf("expected a single pattern-labelled series:\n%s\nmetrics:\n%s", want, respBody)
+	}
+	if strings.Contains(respBody, `addr="/users/1"`) {
+		t.Error("raw parametrised path must not be used as label when a pattern is available")
+	}
+}

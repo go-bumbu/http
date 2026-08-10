@@ -128,6 +128,10 @@ func (c *Middleware) logHeadersDebug(r *http.Request, respHeaders http.Header) {
 	c.logger.LogAttrs(r.Context(), slog.LevelDebug, "", attrs...)
 }
 
+// userIp returns the client IP for logging. X-Real-Ip and X-Forwarded-For are trusted
+// unconditionally: this assumes the server runs behind a reverse proxy that sets them.
+// If the server is exposed directly, clients can spoof these headers — do not use the
+// logged IP for security decisions.
 func userIp(r *http.Request) string {
 	IPAddress := r.Header.Get("X-Real-Ip")
 	if IPAddress == "" {
