@@ -1,10 +1,11 @@
 module github.com/go-bumbu/http
 
-go 1.23.0
+go 1.25.14
 
 require (
 	github.com/google/go-cmp v0.6.0
 	github.com/prometheus/client_golang v1.20.5
+	golang.org/x/time v0.12.0
 )
 
 require (
