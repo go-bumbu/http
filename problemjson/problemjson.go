@@ -57,6 +57,9 @@ const (
 
 // SlugMasked is the generic identity every problem collapses to under
 // ModeMasked. Its title is overridable via Cfg.Titles like any other slug.
+// It also registers a default title for the slug "error", so a caller
+// that already uses "error" as its own slug will see TitleFor("error")
+// return this default.
 const SlugMasked = "error"
 
 // defaultTitles are the human titles for the library-owned slugs above.
@@ -77,11 +80,14 @@ var defaultTitles = map[string]string{
 
 // Details is an RFC 9457 problem detail object.
 type Details struct {
-	Type      string `json:"type"`
-	Title     string `json:"title"`
-	Status    int    `json:"status"`
-	Detail    string `json:"detail,omitempty"`
-	Instance  string `json:"instance,omitempty"`
+	Type     string `json:"type"`
+	Title    string `json:"title"`
+	Status   int    `json:"status"`
+	Detail   string `json:"detail,omitempty"`
+	Instance string `json:"instance,omitempty"`
+	// Reference is a caller-supplied correlation id (RFC 9457 extension member,
+	// from Cfg.RequestID), emitted in both modes when non-empty so a masked
+	// response can still be traced to its real detail in logs.
 	Reference string `json:"reference,omitempty"`
 }
 
@@ -164,6 +170,9 @@ func New(cfg Cfg) (*Writer, error) {
 // (BaseURI + "/" + slug) and Title is derived from slug via TitleFor; Instance
 // is always the request path, so a client can tell which call failed without
 // re-reading its own request.
+// Under ModeMasked the type and title are replaced with the generic
+// SlugMasked identity and detail is omitted; a non-empty reference is
+// included in both modes.
 func (wr *Writer) Write(w http.ResponseWriter, r *http.Request, status int, slug, detail string) {
 	d := Details{
 		Type:      wr.TypeURI(slug),
@@ -181,6 +190,8 @@ func (wr *Writer) Write(w http.ResponseWriter, r *http.Request, status int, slug
 
 // WriteValidation reports a well-formed but invalid request: always 422,
 // optionally itemising which fields failed and why.
+// Under ModeMasked the field errors are dropped and the body collapses
+// to the generic SlugMasked identity (still 422).
 func (wr *Writer) WriteValidation(w http.ResponseWriter, r *http.Request, detail string, fields ...FieldError) {
 	const status = http.StatusUnprocessableEntity
 	d := Details{
@@ -203,6 +214,8 @@ func (wr *Writer) WriteValidation(w http.ResponseWriter, r *http.Request, detail
 // UpstreamError.HTTPStatus). Detail is the error's human-readable sentence, or
 // fallback for an error that does not implement UpstreamError — never a raw Go
 // error.
+// Under ModeMasked the type, title, and detail are masked as for Write;
+// only the status, instance, and reference remain.
 func (wr *Writer) WriteUpstream(w http.ResponseWriter, r *http.Request, err error, fallback string) {
 	status, detail := http.StatusBadGateway, fallback
 	var ue UpstreamError
