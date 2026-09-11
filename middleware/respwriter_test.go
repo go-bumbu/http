@@ -19,7 +19,7 @@ import (
 
 func TestStatWriter_WriteHeader_OnlyOnce(t *testing.T) {
 	rec := httptest.NewRecorder()
-	sw := NewWriter(rec, false, false)
+	sw := NewWriter(rec, false)
 
 	sw.WriteHeader(http.StatusNotFound)
 	sw.WriteHeader(http.StatusOK)
@@ -34,7 +34,7 @@ func TestStatWriter_WriteHeader_OnlyOnce(t *testing.T) {
 
 func TestStatWriter_DefaultStatus(t *testing.T) {
 	rec := httptest.NewRecorder()
-	sw := NewWriter(rec, false, false)
+	sw := NewWriter(rec, false)
 
 	if sw.StatusCode() != http.StatusOK {
 		t.Errorf("expected default status %d, got %d", http.StatusOK, sw.StatusCode())
@@ -43,7 +43,7 @@ func TestStatWriter_DefaultStatus(t *testing.T) {
 
 func TestStatWriter_Write_PassthroughOnSuccess(t *testing.T) {
 	rec := httptest.NewRecorder()
-	sw := NewWriter(rec, true, false)
+	sw := NewWriter(rec, true)
 
 	sw.WriteHeader(http.StatusOK)
 	n, err := sw.Write([]byte("hello"))
@@ -59,32 +59,9 @@ func TestStatWriter_Write_PassthroughOnSuccess(t *testing.T) {
 	}
 }
 
-func TestStatWriter_Write_BuffersOnError(t *testing.T) {
-	rec := httptest.NewRecorder()
-	sw := NewWriter(rec, true, false)
-
-	sw.WriteHeader(http.StatusInternalServerError)
-	n, err := sw.Write([]byte("db broke"))
-
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if n != 8 {
-		t.Errorf("expected n=8, got %d", n)
-	}
-	// Body should NOT be written to recorder (buffered only)
-	if rec.Body.Len() != 0 {
-		t.Errorf("expected empty recorder body, got %q", rec.Body.String())
-	}
-	// Buffer should have the content
-	if sw.buf.String() != "db broke" {
-		t.Errorf("expected buffer 'db broke', got %q", sw.buf.String())
-	}
-}
-
 func TestStatWriter_Write_TeeOnError(t *testing.T) {
 	rec := httptest.NewRecorder()
-	sw := NewWriter(rec, true, true)
+	sw := NewWriter(rec, true)
 
 	sw.WriteHeader(http.StatusBadGateway)
 	n, err := sw.Write([]byte("upstream error"))
@@ -95,18 +72,18 @@ func TestStatWriter_Write_TeeOnError(t *testing.T) {
 	if n != 14 {
 		t.Errorf("expected n=14, got %d", n)
 	}
-	// Body should be written to both recorder and buffer
+	// Error bodies are teed to the client and buffered for logging.
 	if rec.Body.String() != "upstream error" {
 		t.Errorf("expected recorder body 'upstream error', got %q", rec.Body.String())
 	}
-	if !sw.BodyForwarded() {
-		t.Error("expected BodyForwarded() to be true")
+	if sw.buf.String() != "upstream error" {
+		t.Errorf("expected buffered body 'upstream error', got %q", sw.buf.String())
 	}
 }
 
 func TestStatWriter_BufferOverflow(t *testing.T) {
 	rec := httptest.NewRecorder()
-	sw := NewWriter(rec, true, true)
+	sw := NewWriter(rec, true)
 	sw.WriteHeader(http.StatusInternalServerError)
 
 	// Write more than 2000 bytes
@@ -129,24 +106,6 @@ func TestStatWriter_BufferOverflow(t *testing.T) {
 	}
 	if sw.buf.Len() != 2000 {
 		t.Errorf("expected buffer len 2000, got %d", sw.buf.Len())
-	}
-}
-
-func TestStatWriter_DeferredHeader(t *testing.T) {
-	rec := httptest.NewRecorder()
-	sw := NewWriter(rec, true, false)
-
-	sw.WriteHeader(http.StatusBadRequest)
-
-	// Header should be deferred (not yet written to recorder)
-	// httptest.ResponseRecorder defaults Code to 200, only changes on explicit WriteHeader
-	if sw.headerWritten {
-		t.Error("expected header to be deferred")
-	}
-
-	sw.flushHeader()
-	if !sw.headerWritten {
-		t.Error("expected header to be written after flushHeader")
 	}
 }
 
@@ -187,7 +146,7 @@ func (c *countingRW) Write(b []byte) (int, error) {
 // commit during Write must be recorded so flushHeader becomes a no-op.
 func TestStatWriter_NoSuperfluousWriteHeader(t *testing.T) {
 	crw := &countingRW{}
-	sw := NewWriter(crw, true, true) // matches the Logging middleware config
+	sw := NewWriter(crw, true) // matches the Logging middleware config
 
 	// Success handler: writes body without an explicit WriteHeader call.
 	_, _ = sw.Write([]byte("hello"))
@@ -201,20 +160,10 @@ func TestStatWriter_NoSuperfluousWriteHeader(t *testing.T) {
 
 func TestStatWriter_Unwrap(t *testing.T) {
 	rec := httptest.NewRecorder()
-	sw := NewWriter(rec, false, false)
+	sw := NewWriter(rec, false)
 
 	if sw.Unwrap() != rec {
 		t.Error("Unwrap should return the underlying ResponseWriter")
-	}
-}
-
-func TestStatWriter_StatusCodeStr(t *testing.T) {
-	rec := httptest.NewRecorder()
-	sw := NewWriter(rec, false, false)
-	sw.WriteHeader(http.StatusTeapot)
-
-	if sw.StatusCodeStr() != "418" {
-		t.Errorf("expected '418', got %q", sw.StatusCodeStr())
 	}
 }
 
@@ -222,7 +171,7 @@ func TestStatWriter_StatusCodeStr(t *testing.T) {
 // middleware that type-assert w.(http.Flusher) instead of using http.ResponseController
 // must still be able to stream through StatWriter.
 func TestStatWriter_ImplementsFlusher(t *testing.T) {
-	sw := NewWriter(httptest.NewRecorder(), true, true)
+	sw := NewWriter(httptest.NewRecorder(), true)
 
 	if _, ok := interface{}(sw).(http.Flusher); !ok {
 		t.Error("StatWriter must implement http.Flusher for legacy type assertions")
@@ -233,11 +182,11 @@ func TestStatWriter_ImplementsFlusher(t *testing.T) {
 }
 
 // TestStatWriter_FlushErrorUnsupported verifies that flushing a writer that cannot flush
-// reports ErrNotSupported (as http.ResponseController does) and leaves interception intact,
-// so the middleware can still replace the body.
+// reports ErrNotSupported (as http.ResponseController does) and leaves body interception
+// intact, so the error body is still captured for logging.
 func TestStatWriter_FlushErrorUnsupported(t *testing.T) {
 	// countingRW implements neither Flush nor FlushError.
-	sw := NewWriter(&countingRW{}, true, false)
+	sw := NewWriter(&countingRW{}, true)
 	sw.WriteHeader(http.StatusBadGateway)
 
 	err := sw.FlushError()
@@ -247,63 +196,6 @@ func TestStatWriter_FlushErrorUnsupported(t *testing.T) {
 	if sw.Streaming() {
 		t.Error("a failed flush must not release body interception")
 	}
-	if !sw.canReplaceBody() {
-		t.Error("middleware must still be able to replace the body after a failed flush")
-	}
-}
-
-// TestStatWriter_FlushCommitsDeferredStatus is the regression test for the status-code
-// downgrade: with the header deferred (teeOnErr false), a flush used to unwrap past
-// StatWriter and implicitly commit WriteHeader(200), discarding the real status code.
-func TestStatWriter_FlushCommitsDeferredStatus(t *testing.T) {
-	rec := httptest.NewRecorder()
-	sw := NewWriter(rec, true, false)
-
-	sw.WriteHeader(http.StatusServiceUnavailable)
-	if sw.headerWritten {
-		t.Fatal("precondition: header should be deferred")
-	}
-
-	sw.Flush()
-
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("expected status %d committed on flush, got %d",
-			http.StatusServiceUnavailable, rec.Code)
-	}
-	if !sw.Streaming() {
-		t.Error("expected Streaming() to be true after a flush")
-	}
-}
-
-// TestStatWriter_FlushForwardsBufferedBody verifies that bytes written before the first
-// flush are not lost: they are forwarded to the client once interception is released.
-func TestStatWriter_FlushForwardsBufferedBody(t *testing.T) {
-	rec := httptest.NewRecorder()
-	sw := NewWriter(rec, true, false)
-
-	sw.WriteHeader(http.StatusServiceUnavailable)
-	_, _ = sw.Write([]byte("first chunk"))
-	if rec.Body.Len() != 0 {
-		t.Fatal("precondition: body should be buffered before the flush")
-	}
-
-	sw.Flush()
-
-	if rec.Body.String() != "first chunk" {
-		t.Errorf("expected buffered body forwarded, got %q", rec.Body.String())
-	}
-	// The buffer must stay readable so the log still gets the error message.
-	if sw.buf.String() != "first chunk" {
-		t.Errorf("expected buffer preserved for logging, got %q", sw.buf.String())
-	}
-	// Subsequent writes go straight through.
-	_, _ = sw.Write([]byte("|second"))
-	if rec.Body.String() != "first chunk|second" {
-		t.Errorf("expected passthrough after flush, got %q", rec.Body.String())
-	}
-	if sw.canReplaceBody() {
-		t.Error("middleware must not replace the body of a streamed response")
-	}
 }
 
 // TestStatWriter_HijackSuppressesHeaderWrite verifies that after the handler takes over the
@@ -311,7 +203,7 @@ func TestStatWriter_FlushForwardsBufferedBody(t *testing.T) {
 // "response.WriteHeader on hijacked connection" and which would corrupt the raw response).
 func TestStatWriter_HijackSuppressesHeaderWrite(t *testing.T) {
 	hw := &hijackableRW{countingRW: countingRW{}}
-	sw := NewWriter(hw, true, true)
+	sw := NewWriter(hw, true)
 
 	if _, _, err := sw.Hijack(); err != nil {
 		t.Fatalf("unexpected hijack error: %v", err)
@@ -320,9 +212,6 @@ func TestStatWriter_HijackSuppressesHeaderWrite(t *testing.T) {
 
 	if hw.writeHeaderCalls != 0 {
 		t.Errorf("expected no WriteHeader after hijack, got %d calls", hw.writeHeaderCalls)
-	}
-	if sw.canReplaceBody() {
-		t.Error("middleware must not write a body after a hijack")
 	}
 }
 
@@ -544,7 +433,7 @@ func TestStreaming_NestedStatWriters(t *testing.T) {
 // ErrHijacked (matching net/http's Write behaviour) instead of silently succeeding.
 func TestStatWriter_FlushAfterHijack(t *testing.T) {
 	hw := &hijackableRW{countingRW: countingRW{}}
-	sw := NewWriter(hw, true, true)
+	sw := NewWriter(hw, true)
 
 	if _, _, err := sw.Hijack(); err != nil {
 		t.Fatalf("unexpected hijack error: %v", err)
@@ -575,7 +464,7 @@ func (rf *readerFromRW) ReadFrom(src io.Reader) (int64, error) {
 // the underlying fast path and does not issue a superfluous WriteHeader afterwards.
 func TestStatWriter_ReadFrom_FastPathOnSuccess(t *testing.T) {
 	rf := &readerFromRW{}
-	sw := NewWriter(rf, true, true)
+	sw := NewWriter(rf, true)
 
 	// Hide WriterTo from io.Copy (strings.Reader implements it), so the copy
 	// exercises dst.ReadFrom — as it does with a real *os.File source.
@@ -599,12 +488,12 @@ func TestStatWriter_ReadFrom_FastPathOnSuccess(t *testing.T) {
 	}
 }
 
-// TestStatWriter_ReadFrom_InterceptsOnError verifies that the fast path is NOT taken while
-// an error body is intercepted: the bytes must go through Write so they are buffered for
-// logging and withheld from the client (no-tee), exactly as a plain Write would be.
+// TestStatWriter_ReadFrom_InterceptsOnError verifies that the ReaderFrom fast path is NOT
+// taken while an error body is intercepted: the bytes go through Write so they are buffered
+// for logging (and teed to the client) instead of handed straight to the underlying ReadFrom.
 func TestStatWriter_ReadFrom_InterceptsOnError(t *testing.T) {
 	rf := &readerFromRW{}
-	sw := NewWriter(rf, true, false)
+	sw := NewWriter(rf, true)
 	sw.WriteHeader(http.StatusBadGateway)
 
 	src := io.LimitReader(strings.NewReader("upstream error"), 14)
@@ -613,9 +502,6 @@ func TestStatWriter_ReadFrom_InterceptsOnError(t *testing.T) {
 	}
 	if rf.readFromCalled {
 		t.Error("fast path must not bypass error-body interception")
-	}
-	if rf.got.Len() != 0 || rf.writeHeaderCalls != 0 {
-		t.Error("intercepted body must not reach the underlying writer")
 	}
 	if sw.buf.String() != "upstream error" {
 		t.Errorf("expected buffered body for logging, got %q", sw.buf.String())

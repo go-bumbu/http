@@ -72,7 +72,7 @@ func (c *Middleware) Middleware(next http.Handler) http.Handler {
 		timeStart := time.Now()
 		// The middleware never modifies the body; tee error responses so the client still
 		// receives them during e.g. a reverse-proxy copy—avoids an indefinite hang on 401.
-		respWriter := NewWriter(w, true, true)
+		respWriter := NewWriter(w, true)
 
 		if c.panicRecover {
 			defer func() {

@@ -69,7 +69,7 @@ func Logging(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			timeStart := time.Now()
-			respWriter := NewWriter(w, true, true)
+			respWriter := NewWriter(w, true)
 
 			next.ServeHTTP(respWriter, r)
 			timeDiff := time.Since(timeStart)

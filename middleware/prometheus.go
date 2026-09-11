@@ -18,7 +18,7 @@ func Metrics(hist Histogram) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			timeStart := time.Now()
-			respWriter := NewWriter(w, false, false)
+			respWriter := NewWriter(w, false)
 
 			next.ServeHTTP(respWriter, r)
 			timeDiff := time.Since(timeStart)

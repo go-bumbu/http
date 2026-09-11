@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strconv"
 )
 
 // StatWriter is a wrapper to a httpResponse writer that allows to intercept and
@@ -14,11 +13,9 @@ import (
 type StatWriter struct {
 	http.ResponseWriter
 	statusCode    int
-	interceptBody bool // buffer body for non-200 responses
-	teeOnErr      bool // when true, also forward body to client (avoids hang on proxy copy)
+	interceptBody bool // buffer error-response bodies for logging (and tee them to the client)
 	buf           *limitBuf
 	headerWritten bool
-	bodyForwarded bool // true when body was written to client (via tee)
 	streaming     bool // true once the handler flushed: body interception is released
 	hijacked      bool // true once the connection was taken over by the handler
 }
@@ -28,17 +25,16 @@ type StatWriter struct {
 // is dropped and flagged via limitBuf.Truncated.
 const bufMaxBytes = 2000
 
-// NewWriter returns a StatWriter. When interceptBody is true and status is an error
-// (>= 400, see IsStatusError), the body is buffered. If teeOnErr is also true, the body is also
-// forwarded to the client immediately (avoids hang when e.g. a reverse proxy copies the
-// response). When teeOnErr is false, only the buffer is written; the middleware must
-// write the body (e.g. when it will replace it with genericErrs).
-func NewWriter(w http.ResponseWriter, interceptBody bool, teeOnErr bool) *StatWriter {
+// NewWriter returns a StatWriter. When interceptBody is true and the status is an error
+// (>= 400, see IsStatusError), the response body is buffered for logging and simultaneously
+// forwarded to the client — the tee avoids a hang when e.g. a reverse proxy copies the
+// response. When interceptBody is false the writer is a pass-through that only records the
+// status code.
+func NewWriter(w http.ResponseWriter, interceptBody bool) *StatWriter {
 	return &StatWriter{
 		ResponseWriter: w,
 		statusCode:     http.StatusOK,
 		interceptBody:  interceptBody,
-		teeOnErr:       teeOnErr,
 		buf:            newLimitBuf(bufMaxBytes),
 	}
 }
@@ -47,30 +43,14 @@ func (r *StatWriter) StatusCode() int {
 	return r.statusCode
 }
 
-func (r *StatWriter) StatusCodeStr() string {
-	return strconv.Itoa(r.statusCode)
-}
-
-// Write returns underlying Write result.
-// For error responses when interceptBody is true: always buffers for logging.
-// When teeOnErr is true, also forwards to client (so proxy copy completes; avoids hang).
-// When teeOnErr is false, buffers only (middleware will write, possibly modified) — unless
-// the handler has flushed, which releases interception so the response can stream.
+// Write buffers error-response bodies for logging (bounded by bufMaxBytes) while always
+// forwarding them to the underlying writer, so the client — or a reverse proxy copying the
+// response — receives the body and does not hang. Success and non-intercepted responses
+// pass straight through.
 func (r *StatWriter) Write(b []byte) (int, error) {
 	if r.interceptBody && IsStatusError(r.statusCode) {
-		// Buffer for logging; excess bytes are silently dropped (observable via limitBuf.Truncated)
+		// Buffer for logging; excess bytes are silently dropped (observable via limitBuf.Truncated).
 		_, _ = r.buf.Write(b)
-		if r.teeOnErr || r.streaming {
-			n, err := r.ResponseWriter.Write(b)
-			if n > 0 {
-				r.bodyForwarded = true
-			}
-			// The underlying Write implicitly committed the header; record it so
-			// flushHeader does not issue a superfluous WriteHeader call.
-			r.headerWritten = true
-			return n, err
-		}
-		return len(b), nil
 	}
 	// The underlying Write implicitly commits the header (WriteHeader(200) if not
 	// already written); record it so flushHeader does not write the header twice.
@@ -78,16 +58,10 @@ func (r *StatWriter) Write(b []byte) (int, error) {
 	return r.ResponseWriter.Write(b)
 }
 
-// BodyForwarded returns true if the response body was already written to the client
-// (e.g. via tee during a proxy copy). The middleware uses this to avoid writing twice.
-func (r *StatWriter) BodyForwarded() bool {
-	return r.bodyForwarded
-}
-
 // ReadFrom implements io.ReaderFrom so that io.Copy-based handlers (http.ServeContent,
 // http.FileServer, ReverseProxy without a BufferPool) keep the underlying writer's
 // sendfile fast path. It only delegates on the plain passthrough path; error responses
-// under interception go through Write, which buffers (and tees) as configured.
+// under interception go through Write, which buffers them for logging and tees them.
 func (r *StatWriter) ReadFrom(src io.Reader) (int64, error) {
 	rf, ok := r.ResponseWriter.(io.ReaderFrom)
 	if !ok || (r.interceptBody && IsStatusError(r.statusCode)) {
@@ -104,9 +78,9 @@ type writerOnly struct {
 	io.Writer
 }
 
-// WriteHeader stores the response status code. When body interception is active and the
-// body will be replaced (teeOnErr is false), the actual header write is deferred so the
-// middleware can set correct Content-Type/Content-Length before flushing.
+// WriteHeader records and forwards the response status code. 1xx informational responses
+// (e.g. 103 Early Hints) pass through without latching, so the real final status is still
+// captured and written.
 func (r *StatWriter) WriteHeader(code int) {
 	if r.headerWritten || r.hijacked {
 		return
@@ -119,10 +93,6 @@ func (r *StatWriter) WriteHeader(code int) {
 		return
 	}
 	r.statusCode = code
-	if r.interceptBody && !r.teeOnErr && IsStatusError(code) && !r.streaming {
-		// Defer: middleware will write headers after determining the final body.
-		return
-	}
 	r.ResponseWriter.WriteHeader(code)
 	r.headerWritten = true
 }
@@ -156,8 +126,8 @@ func (r *StatWriter) FlushError() error {
 		return http.ErrHijacked
 	}
 	if !supportsFlush(r.ResponseWriter) {
-		// Nothing can be streamed; keep interception intact so the middleware can
-		// still replace the body as configured.
+		// Nothing can be streamed; leave interception intact so the error body is
+		// still captured for logging.
 		return errFlushNotSupported()
 	}
 	r.releaseInterception()
@@ -173,56 +143,28 @@ func (r *StatWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 		return nil, nil, err
 	}
 	// The handler now writes the raw response itself. hijacked suppresses our header
-	// write; streaming stops the middleware from appending a replacement body.
+	// write; streaming stops the middleware from synthesising a body afterwards.
 	r.hijacked = true
 	r.streaming = true
 	return conn, brw, nil
 }
 
 // releaseInterception switches the writer to passthrough mode. It is called on the first
-// flush: a handler that flushes is streaming, so the body can no longer be buffered and
-// replaced. Anything already buffered is forwarded to the client first, after committing
-// the deferred status code.
-//
-// NOTE: content buffered beyond the buffer limit before the first flush is lost, since the
-// buffer is sized for logging. A handler writing more than bufMaxBytes before its
-// first flush is not really streaming, so this is accepted.
+// flush: a handler that flushes is streaming, so the status code must be committed before
+// the flush implicitly writes 200. Error bodies are already teed to the client as they are
+// written, so nothing is buffered-but-unsent to forward here.
 func (r *StatWriter) releaseInterception() {
 	if r.streaming {
 		return
 	}
 	r.streaming = true
-
-	if !r.interceptBody || r.teeOnErr || !IsStatusError(r.statusCode) {
-		// Body was never held back; only the header may still be pending.
-		r.flushHeader()
-		return
-	}
-
-	// Commit the real status code before the flush implicitly commits 200.
 	r.flushHeader()
-	// Forward what was buffered so the stream is not missing its leading bytes.
-	// Bytes() does not consume, so the buffer stays available for logging.
-	if b := r.buf.Bytes(); len(b) > 0 {
-		if n, err := r.ResponseWriter.Write(b); n > 0 && err == nil {
-			r.bodyForwarded = true
-		}
-	}
-	// The response is now a stream: the middleware must not append a replacement body.
-	r.bodyForwarded = true
 }
 
-// Streaming reports whether the handler flushed the response, meaning the body was
-// streamed to the client and cannot be intercepted or replaced.
+// Streaming reports whether the handler flushed or hijacked the response, meaning the body
+// has already reached the client and the middleware must not synthesise one over it.
 func (r *StatWriter) Streaming() bool {
 	return r.streaming
-}
-
-// canReplaceBody reports whether the middleware may still write the response body itself.
-// False when the status is not an error, when the body already reached the client (tee or
-// stream), or when the handler hijacked the connection.
-func (r *StatWriter) canReplaceBody() bool {
-	return IsStatusError(r.statusCode) && !r.bodyForwarded && !r.streaming && !r.hijacked
 }
 
 // Unwrap returns the underlying ResponseWriter, allowing http.ResponseController
