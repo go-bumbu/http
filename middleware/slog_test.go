@@ -20,7 +20,6 @@ func TestSlogMiddleware(t *testing.T) {
 		name          string
 		statusCode    int
 		handlerMsg    string
-		genericErr    bool
 		expect        string
 		expectPayload string
 	}{
@@ -35,23 +34,15 @@ func TestSlogMiddleware(t *testing.T) {
 			name:          "capture 4xx handlerMsg",
 			statusCode:    401,
 			handlerMsg:    "unauthorized",
-			expect:        "INFO method=GET url=/metrics response-code=401 req-id= err-handlerMsg=unauthorized ",
+			expect:        "INFO method=GET url=/metrics response-code=401 req-id= err-msg=unauthorized ",
 			expectPayload: "unauthorized",
 		},
 		{
 			name:          "capture error handlerMsg",
 			statusCode:    500,
 			handlerMsg:    "my db broke down",
-			expect:        "ERROR method=GET url=/metrics response-code=500 req-id= err-handlerMsg=my db broke down ",
+			expect:        "ERROR method=GET url=/metrics response-code=500 req-id= err-msg=my db broke down ",
 			expectPayload: "my db broke down",
-		},
-		{
-			name:          "non generic errors logged",
-			statusCode:    500,
-			genericErr:    true,
-			handlerMsg:    "my db broke down",
-			expect:        "ERROR method=GET url=/metrics response-code=500 req-id= err-handlerMsg=my db broke down ",
-			expectPayload: "Internal Server Error",
 		},
 	}
 	for _, tc := range tcs {
@@ -60,11 +51,10 @@ func TestSlogMiddleware(t *testing.T) {
 			buf, logger := newMemSlog()
 
 			m := middleware.New(middleware.Cfg{
-				Logger:      logger,
-				GenericErrs: tc.genericErr,
+				Logger: logger,
 			})
 
-			handler := m.Middleware(th)
+			handler := m.Wrap(th)
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest("GET", "/metrics", nil)
@@ -83,6 +73,47 @@ func TestSlogMiddleware(t *testing.T) {
 				t.Errorf("unexpected value (-got +want)\n%s", diff)
 			}
 
+		})
+	}
+}
+
+// TestLog_RequestID verifies the "req-id" field: the default extractor reads the Request-Id
+// header, and a Cfg.RequestID override reads whatever header (or context) it chooses.
+func TestLog_RequestID(t *testing.T) {
+	tcs := []struct {
+		name      string
+		requestID func(*http.Request) string
+		header    map[string]string
+		want      string
+	}{
+		{
+			name:   "default reads the Request-Id header",
+			header: map[string]string{"Request-Id": "req-abc"},
+			want:   "req-id=req-abc",
+		},
+		{
+			name:      "custom extractor reads a different header",
+			requestID: func(r *http.Request) string { return r.Header.Get("X-Request-Id") },
+			header:    map[string]string{"X-Request-Id": "corr-123"},
+			want:      "req-id=corr-123",
+		},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, logger := newMemSlog()
+			m := middleware.New(middleware.Cfg{Logger: logger, RequestID: tc.requestID})
+			handler := m.Wrap(testHandler(200, "ok"))
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/metrics", nil)
+			for k, v := range tc.header {
+				req.Header.Set(k, v)
+			}
+			handler.ServeHTTP(rec, req)
+
+			if got := buf.String(); !strings.Contains(got, tc.want) {
+				t.Errorf("expected log to contain %q, got %q", tc.want, got)
+			}
 		})
 	}
 }
@@ -176,14 +207,14 @@ func testHandlerWithRespHeaders(body string, respHeaders map[string]string) http
 
 func TestLogHeaders(t *testing.T) {
 	tcs := []struct {
-		name               string
-		logHeaders         bool
-		extraRedact        []string
-		disableRedaction   bool
-		reqHeaders         map[string][]string
-		respHeaders        map[string]string
-		mustContain        []string
-		mustNotContain     []string
+		name             string
+		logHeaders       bool
+		extraRedact      []string
+		disableRedaction bool
+		reqHeaders       map[string][]string
+		respHeaders      map[string]string
+		mustContain      []string
+		mustNotContain   []string
 	}{
 		{
 			name:           "disabled by default — no debug line",
@@ -208,11 +239,11 @@ func TestLogHeaders(t *testing.T) {
 			mustNotContain: []string{"Bearer abc"},
 		},
 		{
-			name:        "ExtraRedactHeaders — case-insensitive match on added header",
-			logHeaders:  true,
-			extraRedact: []string{"x-tenant-secret"},
-			reqHeaders:  map[string][]string{"X-Tenant-Secret": {"super-secret"}},
-			mustContain: []string{"req-headers.X-Tenant-Secret=[REDACTED]"},
+			name:           "ExtraRedactHeaders — case-insensitive match on added header",
+			logHeaders:     true,
+			extraRedact:    []string{"x-tenant-secret"},
+			reqHeaders:     map[string][]string{"X-Tenant-Secret": {"super-secret"}},
+			mustContain:    []string{"req-headers.X-Tenant-Secret=[REDACTED]"},
 			mustNotContain: []string{"super-secret"},
 		},
 		{
@@ -249,7 +280,7 @@ func TestLogHeaders(t *testing.T) {
 				DisableRedaction:   tc.disableRedaction,
 			})
 
-			handler := m.Middleware(th)
+			handler := m.Wrap(th)
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest("GET", "/", nil)
@@ -280,7 +311,7 @@ func TestLogHeaders_LoggerNotDebugEnabled(t *testing.T) {
 	th := testHandlerWithRespHeaders("ok", nil)
 
 	m := middleware.New(middleware.Cfg{Logger: logger, LogHeaders: true})
-	handler := m.Middleware(th)
+	handler := m.Wrap(th)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/", nil)
