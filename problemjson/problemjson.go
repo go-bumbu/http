@@ -183,17 +183,19 @@ func (wr *Writer) Write(w http.ResponseWriter, r *http.Request, status int, slug
 // optionally itemising which fields failed and why.
 func (wr *Writer) WriteValidation(w http.ResponseWriter, r *http.Request, detail string, fields ...FieldError) {
 	const status = http.StatusUnprocessableEntity
-	writeProblem(w, status, ValidationDetails{
-		Details: Details{
-			Type:      wr.TypeURI(SlugValidationError),
-			Title:     wr.TitleFor(SlugValidationError),
-			Status:    status,
-			Detail:    detail,
-			Instance:  r.URL.Path,
-			Reference: wr.reference(r),
-		},
-		Errors: fields,
-	})
+	d := Details{
+		Type:      wr.TypeURI(SlugValidationError),
+		Title:     wr.TitleFor(SlugValidationError),
+		Status:    status,
+		Detail:    detail,
+		Instance:  r.URL.Path,
+		Reference: wr.reference(r),
+	}
+	if wr.mode == ModeMasked {
+		writeProblem(w, status, wr.mask(d))
+		return
+	}
+	writeProblem(w, status, ValidationDetails{Details: d, Errors: fields})
 }
 
 // WriteUpstream reports a failed call to an external service: 429 when the

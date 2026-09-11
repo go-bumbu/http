@@ -421,3 +421,44 @@ func TestMaskedTitleOverride(t *testing.T) {
 		t.Fatalf("Title = %q, want override", got.Title)
 	}
 }
+
+func TestMaskedWriteValidationDropsFields(t *testing.T) {
+	wr, err := New(Cfg{
+		BaseURI:   testBaseURI,
+		Mode:      ModeMasked,
+		RequestID: func(*http.Request) string { return "req-v" },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v0/orders", nil)
+	w := httptest.NewRecorder()
+
+	wr.WriteValidation(w, req, "too many items",
+		FieldError{Pointer: "/items", Detail: "max 10"})
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", w.Code)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := m["errors"]; ok {
+		t.Fatalf("masked validation must not include errors[], body=%s", w.Body.String())
+	}
+	var got Details
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := Details{
+		Type:      testBaseURI + "/error",
+		Title:     "An error occurred",
+		Status:    http.StatusUnprocessableEntity,
+		Instance:  "/api/v0/orders",
+		Reference: "req-v",
+	}
+	if got != want {
+		t.Fatalf("masked validation Details = %+v, want %+v", got, want)
+	}
+}
