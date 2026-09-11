@@ -28,8 +28,8 @@ func scrape(t *testing.T, reg *prometheus.Registry) string {
 	return string(body)
 }
 
-// TestMiddleware exercises the standalone metrics middleware, NewPromHistogram,
-// the label set, and the metric prefix.
+// TestMiddleware exercises metric recording through the combined middleware,
+// NewPromHistogram, the label set, and the metric prefix.
 func TestMiddleware(t *testing.T) {
 	tcs := []struct {
 		name          string
@@ -69,7 +69,7 @@ func TestMiddleware(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to create histogram: %v", err)
 			}
-			h := metrics.Middleware(hist)(testHandler(200, "ok"))
+			h := middleware.New(middleware.Cfg{Metrics: metrics.NewObserver(hist)}).Middleware(testHandler(200, "ok"))
 			tc.requests(h)
 
 			body := scrape(t, reg)
@@ -93,7 +93,7 @@ func TestMiddleware_PatternLabel(t *testing.T) {
 	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /users/{id}", testHandler(200, "ok"))
-	h := metrics.Middleware(hist)(mux)
+	h := middleware.New(middleware.Cfg{Metrics: metrics.NewObserver(hist)}).Middleware(mux)
 	for _, id := range []string{"1", "2", "3"} {
 		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/users/"+id, nil))
 	}
@@ -134,7 +134,7 @@ func TestNilHistogram_Passthrough(t *testing.T) {
 		t.Errorf("NewObserver(zero) = %v, want nil", obs)
 	}
 	rec := httptest.NewRecorder()
-	metrics.Middleware(metrics.Histogram{})(testHandler(204, "")).ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil))
+	middleware.New(middleware.Cfg{Metrics: metrics.NewObserver(metrics.Histogram{})}).Middleware(testHandler(204, "")).ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil))
 	if rec.Code != 204 {
 		t.Errorf("status = %d, want 204", rec.Code)
 	}

@@ -71,29 +71,6 @@ type Logger interface {
 	Error(msg string, args ...any)
 }
 
-// Logging returns a standalone middleware that logs requests using structured logging.
-// Error responses (>= 400) include the response body in the log.
-func Logging(logger Logger) func(http.Handler) http.Handler {
-	if logger == nil {
-		return func(next http.Handler) http.Handler { return next }
-	}
-	m := &Middleware{logger: logger}
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			timeStart := time.Now()
-			respWriter := NewWriter(w, true)
-
-			next.ServeHTTP(respWriter, r)
-			timeDiff := time.Since(timeStart)
-
-			errMsg := m.getErrMsg(respWriter.statusCode, respWriter.buf)
-			m.log(r, respWriter.StatusCode(), errMsg, timeDiff)
-
-			respWriter.flushHeader()
-		})
-	}
-}
-
 func (c *Middleware) log(r *http.Request, statusCode int, errmsg string, dur time.Duration) {
 	if c.logger == nil {
 		return

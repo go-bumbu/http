@@ -21,7 +21,7 @@ This is a Go library (`github.com/go-bumbu/http`) providing reusable HTTP compon
 ### Packages
 
 - **middleware/** — Composable middleware chain using standard `func(next http.Handler) http.Handler` pattern. Stdlib-only: structured logging (slog) via the `Logger` interface, panic recovery, and a development delay. Metrics flow through the `Observer` interface.
-- **middleware/metrics/** — Prometheus-backed `Observer` implementation (`NewObserver`), the request-duration histogram (`NewPromHistogram`), and a standalone metrics `Middleware`. The only package that imports `prometheus/client_golang`.
+- **middleware/metrics/** — Prometheus-backed `Observer` implementation (`NewObserver`), the request-duration histogram (`NewPromHistogram`). The only package that imports `prometheus/client_golang`.
 - **spa/** — Single Page Application handler serving files from an `fs.FS` (typically embedded).
 
 ### Key Design Decisions

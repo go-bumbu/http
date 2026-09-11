@@ -1,7 +1,7 @@
 // Package metrics provides a Prometheus-backed implementation of
-// middleware.Observer plus a standalone metrics middleware. It is the only
-// package in this module that imports the Prometheus client, so consumers that
-// import only middleware do not compile or link Prometheus.
+// middleware.Observer. It is the only package in this module that imports the
+// Prometheus client, so consumers that import only middleware do not compile or
+// link Prometheus.
 package metrics
 
 import (
@@ -83,23 +83,6 @@ func (o observer) Observe(status int, r *http.Request, d time.Duration) {
 		"addr":    metricAddr(r),
 		"isError": strconv.FormatBool(middleware.IsStatusError(status)),
 	}).Observe(d.Seconds())
-}
-
-// Middleware returns a standalone middleware that records Prometheus request
-// duration metrics. A zero Histogram yields a transparent passthrough.
-func Middleware(hist Histogram) func(http.Handler) http.Handler {
-	obs := NewObserver(hist)
-	if obs == nil {
-		return func(next http.Handler) http.Handler { return next }
-	}
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			start := time.Now()
-			sw := middleware.NewWriter(w, false)
-			next.ServeHTTP(sw, r)
-			obs.Observe(sw.StatusCode(), r, time.Since(start))
-		})
-	}
 }
 
 // metricAddr returns the value for the "addr" metric label. The matched route

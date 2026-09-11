@@ -405,13 +405,14 @@ func TestStreaming_LargeBodyNotTruncated(t *testing.T) {
 	}
 }
 
-// TestStreaming_NestedStatWriters verifies that two stacked StatWriters (Logging wrapping
-// Logging) compose: the outer writer's releaseInterception writes into the inner one,
-// which must not duplicate, drop, or envelope-wrap the streamed error body.
+// TestStreaming_NestedStatWriters verifies that two stacked StatWriters (the combined
+// middleware wrapping itself) compose: the outer writer's releaseInterception writes into
+// the inner one, which must not duplicate, drop, or envelope-wrap the streamed error body.
 func TestStreaming_NestedStatWriters(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	const chunks = 3
-	chain := Logging(logger)(Logging(logger)(streamHandler(t, http.StatusServiceUnavailable, chunks, false)))
+	m := New(Cfg{Logger: logger})
+	chain := m.Middleware(m.Middleware(streamHandler(t, http.StatusServiceUnavailable, chunks, false)))
 	srv := httptest.NewServer(chain)
 	defer srv.Close()
 
@@ -522,39 +523,25 @@ func TestPanicRecover_ErrAbortHandlerPropagates(t *testing.T) {
 
 	logBuf := &strings.Builder{}
 	logger := slog.New(slog.NewTextHandler(logBuf, nil))
-	for _, tc := range []struct {
-		name string
-		wrap func(http.Handler) http.Handler
-	}{
-		{"combined", func(h http.Handler) http.Handler {
-			return New(Cfg{PanicRecover: true, Logger: logger}).Middleware(h)
-		}},
-		{"standalone", func(h http.Handler) http.Handler {
-			return PanicRecover(logger)(h)
-		}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			srv := httptest.NewServer(tc.wrap(abortMidStream))
-			defer srv.Close()
+	srv := httptest.NewServer(New(Cfg{PanicRecover: true, Logger: logger}).Middleware(abortMidStream))
+	defer srv.Close()
 
-			resp, err := http.Get(srv.URL)
-			if err != nil {
-				t.Fatalf("get: %v", err)
-			}
-			defer func() { _ = resp.Body.Close() }()
-			body, readErr := io.ReadAll(resp.Body)
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, readErr := io.ReadAll(resp.Body)
 
-			if string(body) != "partial-data-" {
-				t.Errorf("streamed bytes must be intact and unpolluted, got %q", body)
-			}
-			// The whole point: the client must be able to DETECT the truncation.
-			if readErr == nil {
-				t.Error("expected a read error signalling truncation, got clean EOF")
-			}
-			if strings.Contains(logBuf.String(), "panic recovered") {
-				t.Error("ErrAbortHandler must not be logged as a recovered panic")
-			}
-		})
+	if string(body) != "partial-data-" {
+		t.Errorf("streamed bytes must be intact and unpolluted, got %q", body)
+	}
+	// The whole point: the client must be able to DETECT the truncation.
+	if readErr == nil {
+		t.Error("expected a read error signalling truncation, got clean EOF")
+	}
+	if strings.Contains(logBuf.String(), "panic recovered") {
+		t.Error("ErrAbortHandler must not be logged as a recovered panic")
 	}
 }
 

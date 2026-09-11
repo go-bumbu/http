@@ -20,7 +20,7 @@ func (s *spyLogger) Error(string, ...any)                                       
 
 func TestLogging_AcceptsNonSlogLogger(t *testing.T) {
 	spy := &spyLogger{}
-	h := middleware.Logging(spy)(testHandler(200, "ok"))
+	h := middleware.New(middleware.Cfg{Logger: spy}).Middleware(testHandler(200, "ok"))
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x", nil))
 	if spy.records == 0 {
 		t.Fatal("expected the custom Logger to receive a record")
