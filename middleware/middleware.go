@@ -13,7 +13,7 @@ import (
 
 type Cfg struct {
 	PanicRecover bool
-	Logger       *slog.Logger
+	Logger       Logger
 	PromHisto    Histogram
 
 	// LogHeaders, when true, causes the middleware to emit one additional
@@ -60,7 +60,7 @@ func New(cfg Cfg) *Middleware {
 type Middleware struct {
 	panicRecover     bool
 	hist             Histogram
-	logger           *slog.Logger
+	logger           Logger
 	logHeaders       bool
 	disableRedaction bool
 	redact           redactSet

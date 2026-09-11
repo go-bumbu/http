@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -59,9 +60,20 @@ func (s redactSet) headerAttrs(groupName string, h http.Header, disabled bool) s
 	return slog.Group(groupName, attrs...)
 }
 
+// Logger is the subset of *slog.Logger the middleware depends on for request
+// logging. *slog.Logger satisfies it, so callers keep passing slog.New(handler)
+// or slog.Default() unchanged; the interface lets custom or test loggers be
+// substituted and keeps the middleware package from hard-depending on a concrete
+// logger type.
+type Logger interface {
+	Enabled(ctx context.Context, level slog.Level) bool
+	LogAttrs(ctx context.Context, level slog.Level, msg string, attrs ...slog.Attr)
+	Error(msg string, args ...any)
+}
+
 // Logging returns a standalone middleware that logs requests using structured logging.
 // Error responses (>= 400) include the response body in the log.
-func Logging(logger *slog.Logger) func(http.Handler) http.Handler {
+func Logging(logger Logger) func(http.Handler) http.Handler {
 	if logger == nil {
 		return func(next http.Handler) http.Handler { return next }
 	}

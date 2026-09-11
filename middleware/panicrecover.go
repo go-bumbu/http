@@ -9,7 +9,7 @@ import (
 
 // PanicRecover returns a middleware that recovers from panics in downstream handlers,
 // logs the panic with a stack trace, and returns a 500 response to the client.
-func PanicRecover(logger *slog.Logger) func(http.Handler) http.Handler {
+func PanicRecover(logger Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
