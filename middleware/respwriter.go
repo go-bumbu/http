@@ -13,7 +13,6 @@ import (
 type StatWriter struct {
 	http.ResponseWriter
 	statusCode    int
-	interceptBody bool // buffer error-response bodies for logging (and tee them to the client)
 	buf           *limitBuf
 	headerWritten bool
 	streaming     bool // true once the handler flushed: body interception is released
@@ -25,16 +24,14 @@ type StatWriter struct {
 // is dropped and flagged via limitBuf.Truncated.
 const bufMaxBytes = 2000
 
-// NewWriter returns a StatWriter. When interceptBody is true and the status is an error
-// (>= 400, see IsStatusError), the response body is buffered for logging and simultaneously
-// forwarded to the client — the tee avoids a hang when e.g. a reverse proxy copies the
-// response. When interceptBody is false the writer is a pass-through that only records the
-// status code.
-func NewWriter(w http.ResponseWriter, interceptBody bool) *StatWriter {
+// NewWriter returns a StatWriter wrapping w. It records the response status code and, on an
+// error status (>= 400, see IsStatusError), buffers the response body for logging (capped at
+// bufMaxBytes) while simultaneously forwarding it to the client — the tee avoids a hang when
+// e.g. a reverse proxy copies the response. Success and 1xx responses pass straight through.
+func NewWriter(w http.ResponseWriter) *StatWriter {
 	return &StatWriter{
 		ResponseWriter: w,
 		statusCode:     http.StatusOK,
-		interceptBody:  interceptBody,
 		buf:            newLimitBuf(bufMaxBytes),
 	}
 }
@@ -45,10 +42,9 @@ func (r *StatWriter) StatusCode() int {
 
 // Write buffers error-response bodies for logging (bounded by bufMaxBytes) while always
 // forwarding them to the underlying writer, so the client — or a reverse proxy copying the
-// response — receives the body and does not hang. Success and non-intercepted responses
-// pass straight through.
+// response — receives the body and does not hang. Success responses pass straight through.
 func (r *StatWriter) Write(b []byte) (int, error) {
-	if r.interceptBody && IsStatusError(r.statusCode) {
+	if IsStatusError(r.statusCode) {
 		// Buffer for logging; excess bytes are silently dropped (observable via limitBuf.Truncated).
 		_, _ = r.buf.Write(b)
 	}
@@ -60,11 +56,11 @@ func (r *StatWriter) Write(b []byte) (int, error) {
 
 // ReadFrom implements io.ReaderFrom so that io.Copy-based handlers (http.ServeContent,
 // http.FileServer, ReverseProxy without a BufferPool) keep the underlying writer's
-// sendfile fast path. It only delegates on the plain passthrough path; error responses
-// under interception go through Write, which buffers them for logging and tees them.
+// sendfile fast path. It only delegates on the success passthrough path; error responses go
+// through Write, which buffers them for logging and tees them to the client.
 func (r *StatWriter) ReadFrom(src io.Reader) (int64, error) {
 	rf, ok := r.ResponseWriter.(io.ReaderFrom)
-	if !ok || (r.interceptBody && IsStatusError(r.statusCode)) {
+	if !ok || IsStatusError(r.statusCode) {
 		return io.Copy(writerOnly{r}, src)
 	}
 	// The underlying ReadFrom implicitly commits the header, like Write does.
@@ -165,6 +161,15 @@ func (r *StatWriter) releaseInterception() {
 // has already reached the client and the middleware must not synthesise one over it.
 func (r *StatWriter) Streaming() bool {
 	return r.streaming
+}
+
+// Started reports whether the response has been committed: a status code was written to the
+// underlying writer, explicitly via WriteHeader or implicitly by the first Write/ReadFrom.
+// Once started, the middleware must not synthesise a body (e.g. a 500 after a recovered
+// panic): it would append to the partial response under the already-sent status, which
+// net/http itself declines to do.
+func (r *StatWriter) Started() bool {
+	return r.headerWritten
 }
 
 // Unwrap returns the underlying ResponseWriter, allowing http.ResponseController

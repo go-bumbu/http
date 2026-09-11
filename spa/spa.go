@@ -2,72 +2,119 @@ package spa
 
 import (
 	_ "embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
-	"os"
 	"strings"
 )
 
-// Handler is a http handler capable of serving SPAs from a fs.FS ( tested are os.DirFS and embed.FS)
-// configuration:
-// FsSubDir allows to keep more files that only the SPA in an FS and serve the data from a sub dir
-// Notice that the dir path needs to be relative and cannot be ./ or ../; empty string will be replaced by "."
+// Cfg configures a Handler.
+type Cfg struct {
+	// FS holds the SPA assets; os.DirFS and embed.FS are both tested. Required.
+	FS fs.FS
+	// SubDir serves the SPA from a sub-directory of FS, so FS may hold more than
+	// just the SPA. It must be a relative path (not "./" or "../"); "" serves
+	// from the FS root.
+	SubDir string
+	// PathPrefix is the URL path the SPA is mounted under, e.g. "/ui" for
+	// http://host/ui/. It is normalised to a single leading slash and no trailing
+	// slash, so "ui", "/ui", and "/ui/" are equivalent; "" mounts at the root.
+	PathPrefix string
+}
 
-func NewHandler(inputFs fs.FS, fsSubDir, pathPrefix string) (Handler, error) {
-	if inputFs == nil {
-		return Handler{}, fmt.Errorf("fs cannot be nil")
+// New returns a Handler serving the single-page application described by cfg.
+func New(cfg Cfg) (Handler, error) {
+	if cfg.FS == nil {
+		return Handler{}, fmt.Errorf("spa: Cfg.FS cannot be nil")
 	}
-	if fsSubDir != "" {
-		newFs, err := fs.Sub(inputFs, fsSubDir)
+	assets := cfg.FS
+	if cfg.SubDir != "" {
+		sub, err := fs.Sub(assets, cfg.SubDir)
 		if err != nil {
 			return Handler{}, err
 		}
-		inputFs = newFs
+		assets = sub
 	}
-
-	s := Handler{
-		fs:         inputFs,
-		pathPrefix: pathPrefix,
-	}
-	return s, nil
+	return Handler{
+		fs:         assets,
+		pathPrefix: normalizePrefix(cfg.PathPrefix),
+	}, nil
 }
 
+// normalizePrefix canonicalises the mount prefix to a single leading slash and
+// no trailing slash ("ui", "/ui", "/ui/" -> "/ui"), so a caller cannot silently
+// break asset serving by omitting the leading slash. "" stays "" (root mount).
+func normalizePrefix(p string) string {
+	if p == "" {
+		return ""
+	}
+	return "/" + strings.Trim(p, "/")
+}
+
+// Handler is an http.Handler that serves a single-page application from an
+// fs.FS, falling back to the SPA entrypoint (index.html) for unknown paths so
+// client-side routing keeps working across reloads and deep links.
 type Handler struct {
 	fs         fs.FS
-	pathPrefix string // if the SPA is served with a path prefix, e.g. "ui" in  http://my-app.com/ui/
+	pathPrefix string // normalised mount prefix, e.g. "/ui"; "" for the root.
 }
 
 func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-
 	reqPath := strings.TrimPrefix(r.URL.Path, h.pathPrefix)
 	if reqPath == "" || reqPath == "/" {
 		reqPath = "./"
 	}
-
 	reqPath = strings.TrimPrefix(reqPath, "/")
 
-	f, err := h.fs.Open(reqPath)
-	if os.IsNotExist(err) || strings.HasSuffix(reqPath, "/") {
-		// file does not exist or path is a directory, serve index.html
-		r.URL.Path = "/"
-		http.FileServerFS(h.fs).ServeHTTP(w, r)
-		return
-	}
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	// A trailing slash is a directory request: serve the SPA entrypoint.
+	if strings.HasSuffix(reqPath, "/") {
+		h.serveIndex(w, r)
 		return
 	}
 
-	fstat, err := f.Stat()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	}
-	if fstat.IsDir() {
-		// path is an existing dir, in this case we also serve the index file
-		r.URL.Path = "/"
-		http.FileServerFS(h.fs).ServeHTTP(w, r)
+	// Never serve dotfiles (.env, .git/config, ...). http.FileServerFS serves
+	// them, so over an os.DirFS build directory a request for /.env or
+	// /.git/config would return it verbatim; a 404 keeps even the file's
+	// existence hidden. The standard .well-known/ tree (RFC 8615) is the one
+	// exception. A plain //go:embed already drops dotfiles from the binary, so
+	// this mainly guards os.DirFS and an all:-embedded FS.
+	if hasHiddenSegment(reqPath) {
+		http.NotFound(w, r)
 		return
 	}
-	http.StripPrefix(h.pathPrefix, http.FileServerFS(h.fs)).ServeHTTP(w, r)
+
+	// fs.Stat opens and closes internally (via the StatFS fast path that both
+	// os.DirFS and embed.FS implement), so it leaks no descriptor; the file
+	// itself is opened exactly once, by http.FileServerFS below.
+	info, err := fs.Stat(h.fs, reqPath)
+	switch {
+	case errors.Is(err, fs.ErrNotExist) || (err == nil && info.IsDir()):
+		// Unknown path or a directory: hand it to the SPA entrypoint.
+		h.serveIndex(w, r)
+	case err != nil:
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+	default:
+		http.StripPrefix(h.pathPrefix, http.FileServerFS(h.fs)).ServeHTTP(w, r)
+	}
+}
+
+// hasHiddenSegment reports whether any element of the slash-separated path
+// begins with a dot, other than the standard ".well-known" directory. It keeps
+// dotfiles (.env, .git/...) from being served while still allowing .well-known/
+// (RFC 8615: security.txt, ACME challenges, ...).
+func hasHiddenSegment(p string) bool {
+	for _, seg := range strings.Split(p, "/") {
+		if strings.HasPrefix(seg, ".") && seg != ".well-known" {
+			return true
+		}
+	}
+	return false
+}
+
+// serveIndex serves the SPA entrypoint by rewriting the request to the FS root
+// and delegating to the file server.
+func (h Handler) serveIndex(w http.ResponseWriter, r *http.Request) {
+	r.URL.Path = "/"
+	http.FileServerFS(h.fs).ServeHTTP(w, r)
 }

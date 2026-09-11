@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -95,11 +96,11 @@ func TestHandler(t *testing.T) {
 							req := httptest.NewRequest(http.MethodGet, joinPath, nil)
 							w := httptest.NewRecorder()
 
-							handler, err := NewHandler(
-								fileSystem,
-								tc.subDir,
-								pathPrefix,
-							)
+							handler, err := New(Cfg{
+								FS:         fileSystem,
+								SubDir:     tc.subDir,
+								PathPrefix: pathPrefix,
+							})
 							if err != nil {
 								t.Fatal(err)
 							}
@@ -141,4 +142,72 @@ func TestHandler(t *testing.T) {
 		})
 	}
 
+}
+
+// mapFS is a small in-memory SPA tree for exercising handler policy (dotfile
+// blocking, prefix normalisation) without depending on testdata or embed rules.
+func mapFS() fstest.MapFS {
+	return fstest.MapFS{
+		"index.html":               {Data: []byte("test index")},
+		"assets/app.js":            {Data: []byte("app js")},
+		".env":                     {Data: []byte("SECRET=1")},
+		".git/config":              {Data: []byte("[core]")},
+		".well-known/security.txt": {Data: []byte("Contact: mailto:x@y")},
+		".well-known/.secret":      {Data: []byte("nope")},
+	}
+}
+
+func TestNewRejectsNilFS(t *testing.T) {
+	if _, err := New(Cfg{}); err == nil {
+		t.Fatal("New must reject a nil FS")
+	}
+}
+
+// Dotfiles must never be served — http.FileServerFS would serve them, exposing
+// /.env or /.git/config over an os.DirFS build dir — except the standard
+// .well-known/ tree.
+func TestHandlerBlocksDotfiles(t *testing.T) {
+	h, err := New(Cfg{FS: mapFS()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		path string
+		want int
+	}{
+		{"/", http.StatusOK},
+		{"/assets/app.js", http.StatusOK},
+		{"/.env", http.StatusNotFound},
+		{"/.git/config", http.StatusNotFound},
+		{"/.well-known/security.txt", http.StatusOK},  // the one allowed dotpath
+		{"/.well-known/.secret", http.StatusNotFound}, // nested dotfile still blocked
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest(http.MethodGet, c.path, nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != c.want {
+			t.Errorf("%s: code = %d, want %d", c.path, w.Code, c.want)
+		}
+	}
+}
+
+// PathPrefix is normalised, so every spelling of the mount point serves assets
+// from the same place — a missing leading slash no longer silently breaks it.
+func TestHandlerNormalizesPathPrefix(t *testing.T) {
+	for _, prefix := range []string{"ui", "/ui", "/ui/", "ui/"} {
+		h, err := New(Cfg{FS: mapFS(), PathPrefix: prefix})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodGet, "/ui/assets/app.js", nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("prefix %q: /ui/assets/app.js code = %d, want 200", prefix, w.Code)
+		}
+		if body := w.Body.String(); !strings.Contains(body, "app js") {
+			t.Errorf("prefix %q: body = %q, want app.js content", prefix, body)
+		}
+	}
 }

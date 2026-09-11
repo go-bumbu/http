@@ -16,11 +16,10 @@ type spyLogger struct{ records int }
 
 func (s *spyLogger) Enabled(context.Context, slog.Level) bool                   { return true }
 func (s *spyLogger) LogAttrs(context.Context, slog.Level, string, ...slog.Attr) { s.records++ }
-func (s *spyLogger) Error(string, ...any)                                       { s.records++ }
 
 func TestLogging_AcceptsNonSlogLogger(t *testing.T) {
 	spy := &spyLogger{}
-	h := middleware.New(middleware.Cfg{Logger: spy}).Middleware(testHandler(200, "ok"))
+	h := middleware.New(middleware.Cfg{Logger: spy}).Wrap(testHandler(200, "ok"))
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x", nil))
 	if spy.records == 0 {
 		t.Fatal("expected the custom Logger to receive a record")

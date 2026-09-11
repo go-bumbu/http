@@ -32,7 +32,7 @@ func TestLimitBuf_Write(t *testing.T) {
 					t.Errorf("Write(%q) returned n = %d, want %d", w, n, len(w))
 				}
 			}
-			if got := string(b.Bytes()); got != tc.wantContent {
+			if got := b.String(); got != tc.wantContent {
 				t.Errorf("buffer content = %q, want %q", got, tc.wantContent)
 			}
 			if b.Truncated() != tc.wantTruncated {
@@ -56,20 +56,6 @@ func TestLimitBuf_EmptyWriteWhenFullIsNoTruncate(t *testing.T) {
 	}
 }
 
-func TestLimitBuf_ReadBack(t *testing.T) {
-	b := newLimitBuf(20)
-	if _, err := b.Write([]byte("log body")); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	got, err := io.ReadAll(b)
-	if err != nil {
-		t.Fatalf("io.ReadAll: %v", err)
-	}
-	if string(got) != "log body" {
-		t.Errorf("io.ReadAll = %q, want %q", got, "log body")
-	}
-}
-
 // TestLimitBuf_CopyRespectsCap guards the bug that motivated dropping the embedded
 // bytes.Buffer: the old type let io.Copy bypass the cap via the promoted ReadFrom.
 // The source is wrapped to hide its io.WriterTo, so io.Copy cannot take the
@@ -85,7 +71,7 @@ func TestLimitBuf_CopyRespectsCap(t *testing.T) {
 	if n != int64(len("Hello, World!")) {
 		t.Errorf("io.Copy reported n = %d, want %d", n, len("Hello, World!"))
 	}
-	if got := string(b.Bytes()); got != "Hello" {
+	if got := b.String(); got != "Hello" {
 		t.Errorf("buffer content = %q, want %q (cap must hold through io.Copy)", got, "Hello")
 	}
 	if !b.Truncated() {

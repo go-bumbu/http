@@ -109,6 +109,14 @@ type ValidationDetails struct {
 	Errors []FieldError `json:"errors,omitempty"`
 }
 
+// upstreamDetails extends Details with the specific upstream reason. WriteUpstream
+// emits it only in dev mode when the error can name its reason; otherwise (reason
+// unknown, or ModeMasked) the plain Details is written and the field is absent.
+type upstreamDetails struct {
+	Details
+	Reason string `json:"reason,omitempty"`
+}
+
 // UpstreamError is the behaviour WriteUpstream needs from a failed outbound
 // call: an HTTP status and a user-facing message. Any error whose chain
 // implements it is understood, so this package needs no import of the client
@@ -116,6 +124,15 @@ type ValidationDetails struct {
 type UpstreamError interface {
 	HTTPStatus() int
 	UserMessage() string
+}
+
+// upstreamReasoner is an optional companion to UpstreamError: a failed call that
+// can name its specific reason with a short, stable token (e.g. "unreachable").
+// WriteUpstream surfaces it only in dev mode. Like UpstreamError it is matched
+// structurally, so this package still imports nothing from the client that
+// produced the error.
+type upstreamReasoner interface {
+	UpstreamReason() string
 }
 
 // Cfg configures a Writer.
@@ -214,8 +231,13 @@ func (wr *Writer) WriteValidation(w http.ResponseWriter, r *http.Request, detail
 // UpstreamError.HTTPStatus). Detail is the error's human-readable sentence, or
 // fallback for an error that does not implement UpstreamError — never a raw Go
 // error.
-// Under ModeMasked the type, title, and detail are masked as for Write;
-// only the status, instance, and reference remain.
+//
+// In dev mode, when err can also name its specific reason (an optional
+// UpstreamReason() string method), that token is added as a "reason" extension
+// member so a developer sees the exact cause behind the coarse status. Under
+// ModeMasked the type, title, detail, and reason are all stripped as for Write —
+// only the status, instance, and reference remain — so the internal reason never
+// reaches a production client.
 func (wr *Writer) WriteUpstream(w http.ResponseWriter, r *http.Request, err error, fallback string) {
 	status, detail := http.StatusBadGateway, fallback
 	var ue UpstreamError
@@ -228,6 +250,24 @@ func (wr *Writer) WriteUpstream(w http.ResponseWriter, r *http.Request, err erro
 		slug = SlugUpstreamRateLimited
 	case http.StatusGatewayTimeout:
 		slug = SlugUpstreamTimeout
+	}
+
+	if wr.mode != ModeMasked {
+		var ur upstreamReasoner
+		if errors.As(err, &ur) {
+			if reason := ur.UpstreamReason(); reason != "" {
+				d := Details{
+					Type:      wr.TypeURI(slug),
+					Title:     wr.TitleFor(slug),
+					Status:    status,
+					Detail:    detail,
+					Instance:  r.URL.Path,
+					Reference: wr.reference(r),
+				}
+				writeProblem(w, status, upstreamDetails{Details: d, Reason: reason})
+				return
+			}
+		}
 	}
 	wr.Write(w, r, status, slug, detail)
 }

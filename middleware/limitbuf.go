@@ -40,16 +40,6 @@ func (b *limitBuf) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Read drains buffered bytes so io.ReadAll can consume them for logging.
-func (b *limitBuf) Read(p []byte) (int, error) {
-	return b.buf.Read(p)
-}
-
-// Bytes returns the buffered bytes without consuming them.
-func (b *limitBuf) Bytes() []byte {
-	return b.buf.Bytes()
-}
-
 // Truncated reports whether any write was dropped because the cap was reached.
 func (b *limitBuf) Truncated() bool {
 	return b.truncated

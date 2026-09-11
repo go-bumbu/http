@@ -43,7 +43,7 @@ func TestMiddlewareErrorPassthrough(t *testing.T) {
 			m := middleware.New(middleware.Cfg{})
 
 			th := testHandler(tc.statusCode, tc.message)
-			handler := m.Middleware(th)
+			handler := m.Wrap(th)
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest("GET", "/metrics", nil)

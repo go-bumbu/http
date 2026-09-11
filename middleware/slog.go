@@ -61,18 +61,27 @@ func (s redactSet) headerAttrs(groupName string, h http.Header, disabled bool) s
 }
 
 // Logger is the subset of *slog.Logger the middleware depends on for request
-// logging. *slog.Logger satisfies it, so callers keep passing slog.New(handler)
-// or slog.Default() unchanged; the interface lets custom or test loggers be
-// substituted and keeps the middleware package from hard-depending on a concrete
-// logger type.
+// logging: just Enabled and LogAttrs. *slog.Logger satisfies it, so callers keep
+// passing slog.New(handler) or slog.Default() unchanged; the interface lets custom
+// or test loggers be substituted and keeps the middleware package from
+// hard-depending on a concrete logger type.
 type Logger interface {
 	Enabled(ctx context.Context, level slog.Level) bool
 	LogAttrs(ctx context.Context, level slog.Level, msg string, attrs ...slog.Attr)
-	Error(msg string, args ...any)
 }
 
-func (c *Middleware) log(r *http.Request, statusCode int, errmsg string, dur time.Duration) {
-	if c.logger == nil {
+// defaultRequestIDHeader is the request header the built-in correlation-id
+// extractor reads when Cfg.RequestID is nil.
+const defaultRequestIDHeader = "Request-Id"
+
+// defaultRequestID is the built-in Cfg.RequestID: it reads the correlation id
+// from the defaultRequestIDHeader request header.
+func defaultRequestID(r *http.Request) string {
+	return r.Header.Get(defaultRequestIDHeader)
+}
+
+func (m *Middleware) log(r *http.Request, statusCode int, errmsg string, dur time.Duration) {
+	if m.logger == nil {
 		return
 	}
 
@@ -82,10 +91,10 @@ func (c *Middleware) log(r *http.Request, statusCode int, errmsg string, dur tim
 		slog.Duration("req-dur", dur),
 		slog.Int("response-code", statusCode),
 		slog.String("ip", userIp(r)),
-		slog.String("req-id", r.Header.Get("Request-Id")),
+		slog.String("req-id", m.requestID(r)),
 	}
 	if IsStatusError(statusCode) {
-		attrs = append(attrs, slog.String("err-handlerMsg", errmsg))
+		attrs = append(attrs, slog.String("err-msg", errmsg))
 	}
 
 	level := slog.LevelInfo
@@ -93,28 +102,28 @@ func (c *Middleware) log(r *http.Request, statusCode int, errmsg string, dur tim
 		level = slog.LevelError
 	}
 
-	c.logger.LogAttrs(r.Context(), level, "", attrs...)
+	m.logger.LogAttrs(r.Context(), level, "", attrs...)
 }
 
 // logHeadersDebug emits a single slog.LevelDebug record containing request and
 // response headers, with redaction applied according to the middleware config.
 // No-op when header logging is off, no logger is configured, or the logger is
 // not enabled for LevelDebug (avoids iterating header maps in that case).
-func (c *Middleware) logHeadersDebug(r *http.Request, respHeaders http.Header) {
-	if !c.logHeaders || c.logger == nil {
+func (m *Middleware) logHeadersDebug(r *http.Request, respHeaders http.Header) {
+	if !m.logHeaders || m.logger == nil {
 		return
 	}
-	if !c.logger.Enabled(r.Context(), slog.LevelDebug) {
+	if !m.logger.Enabled(r.Context(), slog.LevelDebug) {
 		return
 	}
 	attrs := []slog.Attr{
 		slog.String("method", r.Method),
 		slog.String("url", r.RequestURI),
-		slog.String("req-id", r.Header.Get("Request-Id")),
-		c.redact.headerAttrs("req-headers", r.Header, c.disableRedaction),
-		c.redact.headerAttrs("resp-headers", respHeaders, c.disableRedaction),
+		slog.String("req-id", m.requestID(r)),
+		m.redact.headerAttrs("req-headers", r.Header, m.disableRedaction),
+		m.redact.headerAttrs("resp-headers", respHeaders, m.disableRedaction),
 	}
-	c.logger.LogAttrs(r.Context(), slog.LevelDebug, "", attrs...)
+	m.logger.LogAttrs(r.Context(), slog.LevelDebug, "", attrs...)
 }
 
 // userIp returns the client IP for logging. X-Real-Ip and X-Forwarded-For are trusted

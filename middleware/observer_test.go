@@ -26,7 +26,7 @@ func (s *spyObserver) Observe(status int, _ *http.Request, d time.Duration) {
 func TestCombinedMiddleware_CallsObserver(t *testing.T) {
 	spy := &spyObserver{}
 	m := middleware.New(middleware.Cfg{Metrics: spy})
-	h := m.Middleware(testHandler(503, "boom"))
+	h := m.Wrap(testHandler(503, "boom"))
 
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x", nil))
 

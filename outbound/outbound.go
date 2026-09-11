@@ -157,6 +157,13 @@ func (e *Error) HTTPStatus() int {
 	}
 }
 
+// UpstreamReason returns a short, stable, greppable token naming the specific
+// failure ("unreachable", "timeout", "bad_response", ...) — the same label as
+// Kind.String(). A developer-facing error writer can surface the precise cause
+// without importing this package by looking for an optional UpstreamReason()
+// string method; problemjson.WriteUpstream does exactly that, in dev mode only.
+func (e *Error) UpstreamReason() string { return e.Kind.String() }
+
 // HTTPStatus is the status to answer with for err: 502 by default (also for any
 // error that is not an *Error), or a more precise code from (*Error).HTTPStatus.
 func HTTPStatus(err error) int {
@@ -284,9 +291,6 @@ func sleep(ctx context.Context, d time.Duration) error {
 // On success the caller owns resp.Body and must close it.
 func (c *Client) Get(ctx context.Context, url string, header http.Header, allowStatus ...int) (*http.Response, error) {
 	attempts := c.maxAttempts
-	if attempts < 1 {
-		attempts = 1
-	}
 	backoff := c.backoff
 	var last *Error
 
@@ -296,7 +300,7 @@ func (c *Client) Get(ctx context.Context, url string, header http.Header, allowS
 			if last != nil && last.retryAfter > 0 {
 				wait = last.retryAfter
 			}
-			if err := c.waitFor(ctx, wait); err != nil {
+			if err := c.wait(ctx, wait); err != nil {
 				return nil, err
 			}
 			backoff *= 2
@@ -331,18 +335,10 @@ func (c *Client) Get(ctx context.Context, url string, header http.Header, allowS
 		last = serr
 	}
 
-	if last == nil { // unreachable: the loop always runs at least once
+	if last == nil { // no attempt ran (e.g. a zero-value Client): synthesize a failure
 		last = &Error{Service: c.service, Kind: KindUnavailable, Attempts: attempts}
 	}
-	last.Attempts = attempts
 	return nil, last
-}
-
-func (c *Client) waitFor(ctx context.Context, d time.Duration) error {
-	if c.wait != nil {
-		return c.wait(ctx, d)
-	}
-	return sleep(ctx, d)
 }
 
 // do performs one throttled request, classifying transport failures.

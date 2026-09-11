@@ -16,9 +16,18 @@ type stubUpstream struct {
 	msg    string
 }
 
-func (s stubUpstream) Error() string      { return s.msg }
-func (s stubUpstream) HTTPStatus() int    { return s.status }
+func (s stubUpstream) Error() string       { return s.msg }
+func (s stubUpstream) HTTPStatus() int     { return s.status }
 func (s stubUpstream) UserMessage() string { return s.msg }
+
+// stubUpstreamReason also names its reason, like a real *outbound.Error, so it
+// exercises the dev-mode "reason" enrichment path.
+type stubUpstreamReason struct {
+	stubUpstream
+	reason string
+}
+
+func (s stubUpstreamReason) UpstreamReason() string { return s.reason }
 
 func newTestWriter(t *testing.T) *Writer {
 	t.Helper()
@@ -460,5 +469,96 @@ func TestMaskedWriteValidationDropsFields(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("masked validation Details = %+v, want %+v", got, want)
+	}
+}
+
+func TestWriteUpstreamDevIncludesReason(t *testing.T) {
+	wr := newTestWriter(t) // dev mode is the zero value
+	req := httptest.NewRequest(http.MethodGet, "/api/v0/cover/42", nil)
+	w := httptest.NewRecorder()
+
+	stub := stubUpstreamReason{
+		stubUpstream: stubUpstream{status: http.StatusBadGateway, msg: "Cover Art Archive could not be reached."},
+		reason:       "unreachable",
+	}
+	wr.WriteUpstream(w, req, stub, "fallback message")
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadGateway)
+	}
+	var got upstreamDetails
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, w.Body.String())
+	}
+	if got.Reason != "unreachable" {
+		t.Fatalf("reason = %q, want %q; body=%s", got.Reason, "unreachable", w.Body.String())
+	}
+	// The reason is additive: the coarse slug and human detail are unchanged, so
+	// four 502 kinds still share one type URI while the reason names the cause.
+	if slug := Slug(got.Type); slug != SlugUpstreamError {
+		t.Fatalf("Slug(%q) = %q, want %q", got.Type, slug, SlugUpstreamError)
+	}
+	if got.Detail != stub.msg {
+		t.Fatalf("Detail = %q, want %q", got.Detail, stub.msg)
+	}
+}
+
+func TestWriteUpstreamOmitsReasonWithoutMethod(t *testing.T) {
+	wr := newTestWriter(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v0/x", nil)
+	w := httptest.NewRecorder()
+
+	// stubUpstream implements UpstreamError but not UpstreamReason.
+	wr.WriteUpstream(w, req, stubUpstream{status: http.StatusBadGateway, msg: "down"}, "fallback")
+
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := m["reason"]; ok {
+		t.Fatalf("reason must be omitted when the error can't name it, body=%s", w.Body.String())
+	}
+}
+
+func TestWriteUpstreamOmitsEmptyReason(t *testing.T) {
+	wr := newTestWriter(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v0/x", nil)
+	w := httptest.NewRecorder()
+
+	stub := stubUpstreamReason{stubUpstream: stubUpstream{status: http.StatusBadGateway, msg: "down"}}
+	wr.WriteUpstream(w, req, stub, "fallback")
+
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := m["reason"]; ok {
+		t.Fatalf("an empty reason must be omitted, body=%s", w.Body.String())
+	}
+}
+
+func TestMaskedWriteUpstreamOmitsReason(t *testing.T) {
+	wr, err := New(Cfg{BaseURI: testBaseURI, Mode: ModeMasked})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v0/x", nil)
+	w := httptest.NewRecorder()
+
+	stub := stubUpstreamReason{
+		stubUpstream: stubUpstream{status: http.StatusBadGateway, msg: "boom"},
+		reason:       "unreachable",
+	}
+	wr.WriteUpstream(w, req, stub, "fallback")
+
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := m["reason"]; ok {
+		t.Fatalf("masked mode must not leak the reason, body=%s", w.Body.String())
+	}
+	if _, ok := m["detail"]; ok {
+		t.Fatalf("masked mode must not include detail, body=%s", w.Body.String())
 	}
 }

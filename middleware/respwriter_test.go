@@ -19,7 +19,7 @@ import (
 
 func TestStatWriter_WriteHeader_OnlyOnce(t *testing.T) {
 	rec := httptest.NewRecorder()
-	sw := NewWriter(rec, false)
+	sw := NewWriter(rec)
 
 	sw.WriteHeader(http.StatusNotFound)
 	sw.WriteHeader(http.StatusOK)
@@ -34,7 +34,7 @@ func TestStatWriter_WriteHeader_OnlyOnce(t *testing.T) {
 
 func TestStatWriter_DefaultStatus(t *testing.T) {
 	rec := httptest.NewRecorder()
-	sw := NewWriter(rec, false)
+	sw := NewWriter(rec)
 
 	if sw.StatusCode() != http.StatusOK {
 		t.Errorf("expected default status %d, got %d", http.StatusOK, sw.StatusCode())
@@ -43,7 +43,7 @@ func TestStatWriter_DefaultStatus(t *testing.T) {
 
 func TestStatWriter_Write_PassthroughOnSuccess(t *testing.T) {
 	rec := httptest.NewRecorder()
-	sw := NewWriter(rec, true)
+	sw := NewWriter(rec)
 
 	sw.WriteHeader(http.StatusOK)
 	n, err := sw.Write([]byte("hello"))
@@ -61,7 +61,7 @@ func TestStatWriter_Write_PassthroughOnSuccess(t *testing.T) {
 
 func TestStatWriter_Write_TeeOnError(t *testing.T) {
 	rec := httptest.NewRecorder()
-	sw := NewWriter(rec, true)
+	sw := NewWriter(rec)
 
 	sw.WriteHeader(http.StatusBadGateway)
 	n, err := sw.Write([]byte("upstream error"))
@@ -83,7 +83,7 @@ func TestStatWriter_Write_TeeOnError(t *testing.T) {
 
 func TestStatWriter_BufferOverflow(t *testing.T) {
 	rec := httptest.NewRecorder()
-	sw := NewWriter(rec, true)
+	sw := NewWriter(rec)
 	sw.WriteHeader(http.StatusInternalServerError)
 
 	// Write more than 2000 bytes
@@ -146,7 +146,7 @@ func (c *countingRW) Write(b []byte) (int, error) {
 // commit during Write must be recorded so flushHeader becomes a no-op.
 func TestStatWriter_NoSuperfluousWriteHeader(t *testing.T) {
 	crw := &countingRW{}
-	sw := NewWriter(crw, true) // matches the Logging middleware config
+	sw := NewWriter(crw) // matches the Logging middleware config
 
 	// Success handler: writes body without an explicit WriteHeader call.
 	_, _ = sw.Write([]byte("hello"))
@@ -160,7 +160,7 @@ func TestStatWriter_NoSuperfluousWriteHeader(t *testing.T) {
 
 func TestStatWriter_Unwrap(t *testing.T) {
 	rec := httptest.NewRecorder()
-	sw := NewWriter(rec, false)
+	sw := NewWriter(rec)
 
 	if sw.Unwrap() != rec {
 		t.Error("Unwrap should return the underlying ResponseWriter")
@@ -171,7 +171,7 @@ func TestStatWriter_Unwrap(t *testing.T) {
 // middleware that type-assert w.(http.Flusher) instead of using http.ResponseController
 // must still be able to stream through StatWriter.
 func TestStatWriter_ImplementsFlusher(t *testing.T) {
-	sw := NewWriter(httptest.NewRecorder(), true)
+	sw := NewWriter(httptest.NewRecorder())
 
 	if _, ok := interface{}(sw).(http.Flusher); !ok {
 		t.Error("StatWriter must implement http.Flusher for legacy type assertions")
@@ -186,7 +186,7 @@ func TestStatWriter_ImplementsFlusher(t *testing.T) {
 // intact, so the error body is still captured for logging.
 func TestStatWriter_FlushErrorUnsupported(t *testing.T) {
 	// countingRW implements neither Flush nor FlushError.
-	sw := NewWriter(&countingRW{}, true)
+	sw := NewWriter(&countingRW{})
 	sw.WriteHeader(http.StatusBadGateway)
 
 	err := sw.FlushError()
@@ -203,7 +203,7 @@ func TestStatWriter_FlushErrorUnsupported(t *testing.T) {
 // "response.WriteHeader on hijacked connection" and which would corrupt the raw response).
 func TestStatWriter_HijackSuppressesHeaderWrite(t *testing.T) {
 	hw := &hijackableRW{countingRW: countingRW{}}
-	sw := NewWriter(hw, true)
+	sw := NewWriter(hw)
 
 	if _, _, err := sw.Hijack(); err != nil {
 		t.Fatalf("unexpected hijack error: %v", err)
@@ -312,7 +312,7 @@ func TestStreaming_EndToEnd(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			m := New(tc.cfg)
-			srv := httptest.NewServer(m.Middleware(streamHandler(t, tc.status, chunks, tc.legacyAssert)))
+			srv := httptest.NewServer(m.Wrap(streamHandler(t, tc.status, chunks, tc.legacyAssert)))
 			defer srv.Close()
 
 			status, reads, body := readStreamed(t, srv.URL)
@@ -358,7 +358,7 @@ func TestStreaming_ThroughReverseProxy(t *testing.T) {
 				t.Fatal(err)
 			}
 			m := New(tc.cfg)
-			front := httptest.NewServer(m.Middleware(httputil.NewSingleHostReverseProxy(u)))
+			front := httptest.NewServer(m.Wrap(httputil.NewSingleHostReverseProxy(u)))
 			defer front.Close()
 
 			status, reads, body := readStreamed(t, front.URL)
@@ -382,7 +382,7 @@ func TestStreaming_ThroughReverseProxy(t *testing.T) {
 func TestStreaming_LargeBodyNotTruncated(t *testing.T) {
 	const size = 5000
 	m := New(Cfg{})
-	srv := httptest.NewServer(m.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		rc := http.NewResponseController(w)
 		if err := rc.Flush(); err != nil {
@@ -412,7 +412,7 @@ func TestStreaming_NestedStatWriters(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	const chunks = 3
 	m := New(Cfg{Logger: logger})
-	chain := m.Middleware(m.Middleware(streamHandler(t, http.StatusServiceUnavailable, chunks, false)))
+	chain := m.Wrap(m.Wrap(streamHandler(t, http.StatusServiceUnavailable, chunks, false)))
 	srv := httptest.NewServer(chain)
 	defer srv.Close()
 
@@ -434,7 +434,7 @@ func TestStreaming_NestedStatWriters(t *testing.T) {
 // ErrHijacked (matching net/http's Write behaviour) instead of silently succeeding.
 func TestStatWriter_FlushAfterHijack(t *testing.T) {
 	hw := &hijackableRW{countingRW: countingRW{}}
-	sw := NewWriter(hw, true)
+	sw := NewWriter(hw)
 
 	if _, _, err := sw.Hijack(); err != nil {
 		t.Fatalf("unexpected hijack error: %v", err)
@@ -465,7 +465,7 @@ func (rf *readerFromRW) ReadFrom(src io.Reader) (int64, error) {
 // the underlying fast path and does not issue a superfluous WriteHeader afterwards.
 func TestStatWriter_ReadFrom_FastPathOnSuccess(t *testing.T) {
 	rf := &readerFromRW{}
-	sw := NewWriter(rf, true)
+	sw := NewWriter(rf)
 
 	// Hide WriterTo from io.Copy (strings.Reader implements it), so the copy
 	// exercises dst.ReadFrom — as it does with a real *os.File source.
@@ -494,7 +494,7 @@ func TestStatWriter_ReadFrom_FastPathOnSuccess(t *testing.T) {
 // for logging (and teed to the client) instead of handed straight to the underlying ReadFrom.
 func TestStatWriter_ReadFrom_InterceptsOnError(t *testing.T) {
 	rf := &readerFromRW{}
-	sw := NewWriter(rf, true)
+	sw := NewWriter(rf)
 	sw.WriteHeader(http.StatusBadGateway)
 
 	src := io.LimitReader(strings.NewReader("upstream error"), 14)
@@ -523,7 +523,7 @@ func TestPanicRecover_ErrAbortHandlerPropagates(t *testing.T) {
 
 	logBuf := &strings.Builder{}
 	logger := slog.New(slog.NewTextHandler(logBuf, nil))
-	srv := httptest.NewServer(New(Cfg{PanicRecover: true, Logger: logger}).Middleware(abortMidStream))
+	srv := httptest.NewServer(New(Cfg{PanicRecover: true, Logger: logger}).Wrap(abortMidStream))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL)
@@ -551,7 +551,7 @@ func TestPanicRecover_RealPanicStillHandled(t *testing.T) {
 	logBuf := &strings.Builder{}
 	logger := slog.New(slog.NewTextHandler(logBuf, nil))
 	m := New(Cfg{PanicRecover: true, Logger: logger})
-	srv := httptest.NewServer(m.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		panic("boom")
 	})))
 	defer srv.Close()
@@ -574,7 +574,7 @@ func TestPanicRecover_RealPanicStillHandled(t *testing.T) {
 // final status (which made the real WriteHeader a no-op and reported 200 to the client).
 func TestStatWriter_EarlyHintsPassthrough(t *testing.T) {
 	m := New(Cfg{})
-	srv := httptest.NewServer(m.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Link", "</style.css>; rel=preload")
 		w.WriteHeader(http.StatusEarlyHints)
 		w.WriteHeader(http.StatusEarlyHints) // 1xx may be sent multiple times
@@ -596,7 +596,7 @@ func TestStatWriter_EarlyHintsPassthrough(t *testing.T) {
 // handler obtains the connection, writes the raw response, and the middleware adds nothing.
 func TestHijack_EndToEnd(t *testing.T) {
 	m := New(Cfg{})
-	srv := httptest.NewServer(m.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, brw, err := http.NewResponseController(w).Hijack()
 		if err != nil {
 			t.Errorf("hijack: %v", err)

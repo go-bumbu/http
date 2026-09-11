@@ -286,3 +286,88 @@ func TestKindString(t *testing.T) {
 		}
 	}
 }
+
+// UpstreamReason exposes the failure token to a generic error writer (e.g.
+// problemjson) without that writer importing this package. It must track
+// Kind.String() so the two labels never drift.
+func TestUpstreamReasonTracksKind(t *testing.T) {
+	for _, kind := range []Kind{
+		KindUnavailable, KindRateLimited, KindTimeout,
+		KindUnreachable, KindRejected, KindBadResponse,
+	} {
+		e := &Error{Service: "Example Service", Kind: kind}
+		if got, want := e.UpstreamReason(), kind.String(); got != want {
+			t.Errorf("UpstreamReason() = %q, want %q (Kind.String())", got, want)
+		}
+	}
+}
+
+// BadResponse turns a parse failure on an otherwise-successful response into the
+// same typed upstream error shape as a transport or status failure.
+func TestBadResponseIsTypedUpstreamError(t *testing.T) {
+	c := New(Cfg{Service: "Example Service"})
+	err := c.BadResponse(errors.New("invalid json"))
+
+	var uerr *Error
+	if !errors.As(err, &uerr) {
+		t.Fatalf("want *outbound.Error, got %T: %v", err, err)
+	}
+	if uerr.Kind != KindBadResponse {
+		t.Fatalf("kind = %v, want bad response", uerr.Kind)
+	}
+	if got := HTTPStatus(err); got != http.StatusBadGateway {
+		t.Fatalf("HTTPStatus = %d, want 502", got)
+	}
+	if msg := uerr.UserMessage(); !strings.Contains(msg, "could not be read") {
+		t.Fatalf("unhelpful message: %q", msg)
+	}
+	// The technical detail is preserved for logs.
+	if !strings.Contains(uerr.Error(), "invalid json") {
+		t.Fatalf("parse detail lost: %q", uerr.Error())
+	}
+}
+
+// A provider asking us to wait far longer than RetryAfterCap must not hang a
+// user-facing request: the delay-seconds Retry-After is clamped to the cap.
+func TestGetClampsRetryAfterToCap(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "3600") // one hour, far beyond the cap
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	c, waits := newTestClient(t, srv)
+	_, _ = c.Get(context.Background(), srv.URL, nil)
+
+	if len(*waits) == 0 {
+		t.Fatal("expected at least one retry wait")
+	}
+	for _, w := range *waits {
+		if w != maxRetryAfterWait {
+			t.Fatalf("Retry-After must clamp to %v, got %v", maxRetryAfterWait, *waits)
+		}
+	}
+}
+
+// Retry-After may be an HTTP-date instead of delay-seconds; it is parsed and
+// then clamped to the cap like any other wait.
+func TestGetParsesHTTPDateRetryAfter(t *testing.T) {
+	future := time.Now().Add(time.Hour).UTC().Format(http.TimeFormat)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", future) // HTTP-date form, far in the future
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	c, waits := newTestClient(t, srv)
+	_, _ = c.Get(context.Background(), srv.URL, nil)
+
+	if len(*waits) == 0 {
+		t.Fatal("expected at least one retry wait")
+	}
+	for _, w := range *waits {
+		if w != maxRetryAfterWait {
+			t.Fatalf("HTTP-date Retry-After should clamp to %v, got %v", maxRetryAfterWait, *waits)
+		}
+	}
+}
