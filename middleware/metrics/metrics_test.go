@@ -139,3 +139,20 @@ func TestNilHistogram_Passthrough(t *testing.T) {
 		t.Errorf("status = %d, want 204", rec.Code)
 	}
 }
+
+// TestNewPromHistogram_DuplicateRegister covers the registry.Register error path:
+// registering a second histogram with the same name on one registry must fail and
+// return the zero Histogram.
+func TestNewPromHistogram_DuplicateRegister(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	if _, err := metrics.NewPromHistogram("", nil, reg); err != nil {
+		t.Fatalf("first registration failed: %v", err)
+	}
+	h, err := metrics.NewPromHistogram("", nil, reg)
+	if err == nil {
+		t.Fatal("expected an error registering a duplicate histogram, got nil")
+	}
+	if h != (metrics.Histogram{}) {
+		t.Errorf("expected the zero Histogram on error, got %+v", h)
+	}
+}

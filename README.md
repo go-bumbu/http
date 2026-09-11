@@ -20,7 +20,7 @@ Middleware can be used individually or combined via the `Middleware` struct whic
 | Middleware | Import | Description |
 |---|---|---|
 | `Logging` | `middleware.Logging(logger)` | Structured request logging via `log/slog`. Logs at INFO for client errors, ERROR for server errors. Captures error response bodies. |
-| `Metrics` | `metrics.Middleware(hist)` | Prometheus histogram recording request duration, method, path, status code, and error flag. Lives in `middleware/metrics` — import it only when you want Prometheus. |
+| `Middleware` | `metrics.Middleware(hist)` | Prometheus histogram recording request duration, method, path, status code, and error flag. Lives in `middleware/metrics` — import it only when you want Prometheus. |
 | `PanicRecover` | `middleware.PanicRecover(logger)` | Recovers from panics, logs a stack trace, and returns 500 to the client. |
 | `ReqDelay` | `middleware.ReqDelay{...}.Delay` | Adds a random delay between min/max duration. Useful during development to simulate slow backends. |
 

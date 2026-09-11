@@ -28,7 +28,7 @@ type Cfg struct {
 	// LogHeaders, when true, causes the middleware to emit one additional
 	// log record per request at slog.LevelDebug containing request and
 	// response headers. The record is only emitted when the configured
-	// slog.Logger is enabled for LevelDebug.
+	// Logger is enabled for LevelDebug.
 	LogHeaders bool
 
 	// ExtraRedactHeaders lists additional header names whose values are
