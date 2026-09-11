@@ -19,12 +19,3 @@ Notes for editors:
 - todo rewrites the file into the canonical form above on every change, so any
   other free-form markdown placed between items is not kept.
 -->
-
-# Problem
-
-- [ ] rename to something better
-- [ ] make the problem library capable of printing detailed verboes erros in lower envs, and return very generic erros in prod
-
-# middleware
-
-- [ ] evaluate split prometheus from logger
