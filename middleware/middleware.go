@@ -11,10 +11,19 @@ import (
 	"time"
 )
 
+// Observer records a per-request metric. The combined Middleware (and any code
+// using it) calls Observe exactly once per request with the final status code,
+// the request, and the total handler duration. Implementations live outside this
+// package — see github.com/go-bumbu/http/middleware/metrics — which is what keeps
+// middleware free of any metrics-backend dependency.
+type Observer interface {
+	Observe(status int, r *http.Request, d time.Duration)
+}
+
 type Cfg struct {
 	PanicRecover bool
 	Logger       Logger
-	PromHisto    Histogram
+	Metrics      Observer
 
 	// LogHeaders, when true, causes the middleware to emit one additional
 	// log record per request at slog.LevelDebug containing request and
@@ -37,7 +46,7 @@ type Cfg struct {
 func New(cfg Cfg) *Middleware {
 	m := Middleware{
 		panicRecover:     cfg.PanicRecover,
-		hist:             cfg.PromHisto,
+		metrics:          cfg.Metrics,
 		logger:           cfg.Logger,
 		logHeaders:       cfg.LogHeaders,
 		disableRedaction: cfg.DisableRedaction,
@@ -47,7 +56,7 @@ func New(cfg Cfg) *Middleware {
 }
 
 // Middleware is intended perform common actions done by a production http server. It wraps a
-// handler to add request logging, prometheus metrics, and panic recovery. It never modifies the
+// handler to add request logging, metrics, and panic recovery. It never modifies the
 // response body: error responses (>= 400) are forwarded to the client and their bodies captured
 // for logging.
 //
@@ -55,11 +64,12 @@ func New(cfg Cfg) *Middleware {
 // responses. Handlers that stream (flush before the response is complete) or hijack the
 // connection are never modified.
 //
-//   - Histogram: use NewPromHistogram to create an histogram used to capture prometheus metrics about every request
-//     if left empty, no prometheus metric will be captured
+//   - Metrics: supply a middleware.Observer (e.g. metrics.NewObserver from
+//     github.com/go-bumbu/http/middleware/metrics) to record a metric per request;
+//     if nil, no metric is captured.
 type Middleware struct {
 	panicRecover     bool
-	hist             Histogram
+	metrics          Observer
 	logger           Logger
 	logHeaders       bool
 	disableRedaction bool
@@ -139,6 +149,12 @@ func (c *Middleware) finalize(r *http.Request, respWriter *StatWriter, timeStart
 	respWriter.flushHeader()
 
 	c.observe(r, respWriter.StatusCode(), timeDiff)
+}
+
+func (c *Middleware) observe(r *http.Request, statusCode int, dur time.Duration) {
+	if c.metrics != nil {
+		c.metrics.Observe(statusCode, r, dur)
+	}
 }
 
 // getErrMsg returns the error handlerMsg in case of an error response or empty string
