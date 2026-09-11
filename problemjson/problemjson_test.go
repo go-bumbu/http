@@ -339,3 +339,85 @@ func TestWriteValidationIncludesReference(t *testing.T) {
 		t.Fatalf("want 1 field error, got %d", len(got.Errors))
 	}
 }
+
+func TestMaskedWrite(t *testing.T) {
+	wr, err := New(Cfg{
+		BaseURI:   testBaseURI,
+		Mode:      ModeMasked,
+		RequestID: func(*http.Request) string { return "req-9" },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v0/orders/42", nil)
+	w := httptest.NewRecorder()
+
+	wr.Write(w, req, http.StatusInternalServerError, SlugInternal, "db: connection refused")
+
+	var got Details
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, w.Body.String())
+	}
+	want := Details{
+		Type:      testBaseURI + "/error",
+		Title:     "An error occurred",
+		Status:    http.StatusInternalServerError,
+		Instance:  "/api/v0/orders/42",
+		Reference: "req-9",
+	}
+	if got != want {
+		t.Fatalf("masked Details = %+v, want %+v", got, want)
+	}
+}
+
+func TestMaskedWriteUpstreamPreservesStatus(t *testing.T) {
+	wr, err := New(Cfg{BaseURI: testBaseURI, Mode: ModeMasked})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v0/pay", nil)
+	w := httptest.NewRecorder()
+
+	stub := stubUpstream{status: http.StatusGatewayTimeout, msg: "provider slow"}
+	wr.WriteUpstream(w, req, stub, "fallback")
+
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("HTTP status = %d, want 504", w.Code)
+	}
+	var got Details
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Type != testBaseURI+"/error" {
+		t.Fatalf("Type = %q, want masked", got.Type)
+	}
+	if got.Status != http.StatusGatewayTimeout {
+		t.Fatalf("body Status = %d, want 504", got.Status)
+	}
+	if got.Detail != "" {
+		t.Fatalf("Detail = %q, want empty (masked)", got.Detail)
+	}
+}
+
+func TestMaskedTitleOverride(t *testing.T) {
+	wr, err := New(Cfg{
+		BaseURI: testBaseURI,
+		Mode:    ModeMasked,
+		Titles:  map[string]string{SlugMasked: "Request failed"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v0/x", nil)
+	w := httptest.NewRecorder()
+
+	wr.Write(w, req, http.StatusBadRequest, SlugValidationError, "nope")
+
+	var got Details
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Title != "Request failed" {
+		t.Fatalf("Title = %q, want override", got.Title)
+	}
+}

@@ -24,6 +24,21 @@ import (
 	"strings"
 )
 
+// Mode selects how much a problem body reveals to the client.
+type Mode int
+
+const (
+	// ModeDev renders the full, handler-supplied detail (and validation
+	// fields). It is the zero value, so a Writer configured without a Mode
+	// behaves as it did before this option existed.
+	ModeDev Mode = iota
+	// ModeMasked strips the detail and validation fields and replaces the
+	// type/title with a generic identity (SlugMasked), leaving only the HTTP
+	// status, the request instance, and the correlation reference. Use it in
+	// production so internal specifics never reach the client.
+	ModeMasked
+)
+
 // Library-owned slugs. New ships a built-in title for exactly these; a caller
 // supplies titles for its own slugs (and may override these) via Cfg.Titles.
 const (
@@ -40,6 +55,10 @@ const (
 	SlugUpstreamTimeout     = "upstream_timeout"
 )
 
+// SlugMasked is the generic identity every problem collapses to under
+// ModeMasked. Its title is overridable via Cfg.Titles like any other slug.
+const SlugMasked = "error"
+
 // defaultTitles are the human titles for the library-owned slugs above.
 var defaultTitles = map[string]string{
 	SlugNotFound:            "Not found",
@@ -53,6 +72,7 @@ var defaultTitles = map[string]string{
 	SlugUpstreamError:       "Upstream error",
 	SlugUpstreamRateLimited: "Upstream rate limited",
 	SlugUpstreamTimeout:     "Upstream timeout",
+	SlugMasked:              "An error occurred",
 }
 
 // Details is an RFC 9457 problem detail object.
@@ -106,6 +126,9 @@ type Cfg struct {
 	// masked client-facing error can still be traced to the real detail in
 	// logs. Return "" (or leave RequestID nil) to omit the reference.
 	RequestID func(*http.Request) string
+	// Mode selects verbose (ModeDev, the zero value) vs masked (ModeMasked)
+	// rendering for every response this Writer emits.
+	Mode Mode
 }
 
 // Writer emits problem+json responses for one base URI and title set.
@@ -113,6 +136,7 @@ type Writer struct {
 	baseURI   string
 	titles    map[string]string
 	requestID func(*http.Request) string
+	mode      Mode
 }
 
 // New returns a Writer configured by cfg. It errors when BaseURI is empty: the
@@ -132,6 +156,7 @@ func New(cfg Cfg) (*Writer, error) {
 		baseURI:   strings.TrimRight(cfg.BaseURI, "/"),
 		titles:    titles,
 		requestID: cfg.RequestID,
+		mode:      cfg.Mode,
 	}, nil
 }
 
@@ -140,14 +165,18 @@ func New(cfg Cfg) (*Writer, error) {
 // is always the request path, so a client can tell which call failed without
 // re-reading its own request.
 func (wr *Writer) Write(w http.ResponseWriter, r *http.Request, status int, slug, detail string) {
-	writeProblem(w, status, Details{
+	d := Details{
 		Type:      wr.TypeURI(slug),
 		Title:     wr.TitleFor(slug),
 		Status:    status,
 		Detail:    detail,
 		Instance:  r.URL.Path,
 		Reference: wr.reference(r),
-	})
+	}
+	if wr.mode == ModeMasked {
+		d = wr.mask(d)
+	}
+	writeProblem(w, status, d)
 }
 
 // WriteValidation reports a well-formed but invalid request: always 422,
@@ -203,6 +232,19 @@ func (wr *Writer) TitleFor(slug string) string {
 		return title
 	}
 	return slug
+}
+
+// mask rewrites d for ModeMasked: a generic type/title and no detail,
+// preserving the status, instance, and reference so the response is still
+// classifiable and traceable without leaking specifics.
+func (wr *Writer) mask(d Details) Details {
+	return Details{
+		Type:      wr.TypeURI(SlugMasked),
+		Title:     wr.TitleFor(SlugMasked),
+		Status:    d.Status,
+		Instance:  d.Instance,
+		Reference: d.Reference,
+	}
 }
 
 // reference resolves the correlation reference for r, or "" when no extractor
