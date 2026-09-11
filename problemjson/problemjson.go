@@ -57,11 +57,12 @@ var defaultTitles = map[string]string{
 
 // Details is an RFC 9457 problem detail object.
 type Details struct {
-	Type     string `json:"type"`
-	Title    string `json:"title"`
-	Status   int    `json:"status"`
-	Detail   string `json:"detail,omitempty"`
-	Instance string `json:"instance,omitempty"`
+	Type      string `json:"type"`
+	Title     string `json:"title"`
+	Status    int    `json:"status"`
+	Detail    string `json:"detail,omitempty"`
+	Instance  string `json:"instance,omitempty"`
+	Reference string `json:"reference,omitempty"`
 }
 
 // FieldError is one field-level validation failure. Pointer names the failing
@@ -99,12 +100,19 @@ type Cfg struct {
 	// Titles maps a slug to its human title, merged over the built-in defaults
 	// for the library-owned slugs — supply your own slugs, or override a default.
 	Titles map[string]string
+	// RequestID, when set, is called per response to obtain a correlation
+	// reference (typically the caller's request-id / trace-id from context or
+	// a header). Its non-empty result is written to Details.Reference so a
+	// masked client-facing error can still be traced to the real detail in
+	// logs. Return "" (or leave RequestID nil) to omit the reference.
+	RequestID func(*http.Request) string
 }
 
 // Writer emits problem+json responses for one base URI and title set.
 type Writer struct {
-	baseURI string
-	titles  map[string]string
+	baseURI   string
+	titles    map[string]string
+	requestID func(*http.Request) string
 }
 
 // New returns a Writer configured by cfg. It errors when BaseURI is empty: the
@@ -121,8 +129,9 @@ func New(cfg Cfg) (*Writer, error) {
 		titles[slug] = title
 	}
 	return &Writer{
-		baseURI: strings.TrimRight(cfg.BaseURI, "/"),
-		titles:  titles,
+		baseURI:   strings.TrimRight(cfg.BaseURI, "/"),
+		titles:    titles,
+		requestID: cfg.RequestID,
 	}, nil
 }
 
@@ -132,11 +141,12 @@ func New(cfg Cfg) (*Writer, error) {
 // re-reading its own request.
 func (wr *Writer) Write(w http.ResponseWriter, r *http.Request, status int, slug, detail string) {
 	writeProblem(w, status, Details{
-		Type:     wr.TypeURI(slug),
-		Title:    wr.TitleFor(slug),
-		Status:   status,
-		Detail:   detail,
-		Instance: r.URL.Path,
+		Type:      wr.TypeURI(slug),
+		Title:     wr.TitleFor(slug),
+		Status:    status,
+		Detail:    detail,
+		Instance:  r.URL.Path,
+		Reference: wr.reference(r),
 	})
 }
 
@@ -146,11 +156,12 @@ func (wr *Writer) WriteValidation(w http.ResponseWriter, r *http.Request, detail
 	const status = http.StatusUnprocessableEntity
 	writeProblem(w, status, ValidationDetails{
 		Details: Details{
-			Type:     wr.TypeURI(SlugValidationError),
-			Title:    wr.TitleFor(SlugValidationError),
-			Status:   status,
-			Detail:   detail,
-			Instance: r.URL.Path,
+			Type:      wr.TypeURI(SlugValidationError),
+			Title:     wr.TitleFor(SlugValidationError),
+			Status:    status,
+			Detail:    detail,
+			Instance:  r.URL.Path,
+			Reference: wr.reference(r),
 		},
 		Errors: fields,
 	})
@@ -192,6 +203,15 @@ func (wr *Writer) TitleFor(slug string) string {
 		return title
 	}
 	return slug
+}
+
+// reference resolves the correlation reference for r, or "" when no extractor
+// is configured. Callers place it in Details.Reference (omitted when empty).
+func (wr *Writer) reference(r *http.Request) string {
+	if wr.requestID == nil {
+		return ""
+	}
+	return wr.requestID(r)
 }
 
 // Slug returns the last path segment of a problem's Type URI — the old "code"

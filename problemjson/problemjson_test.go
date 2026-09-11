@@ -265,3 +265,77 @@ var errNotUpstream = &plainErr{"plain error"}
 type plainErr struct{ msg string }
 
 func (e *plainErr) Error() string { return e.msg }
+
+func TestWriteIncludesReference(t *testing.T) {
+	wr, err := New(Cfg{
+		BaseURI:   testBaseURI,
+		RequestID: func(*http.Request) string { return "req-123" },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v0/x", nil)
+	w := httptest.NewRecorder()
+
+	wr.Write(w, req, http.StatusInternalServerError, SlugInternal, "boom")
+
+	var got Details
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, w.Body.String())
+	}
+	if got.Reference != "req-123" {
+		t.Fatalf("Reference = %q, want %q", got.Reference, "req-123")
+	}
+}
+
+func TestReferenceOmittedWhenAbsent(t *testing.T) {
+	cases := map[string]func(*http.Request) string{
+		"nil extractor":   nil,
+		"empty extractor": func(*http.Request) string { return "" },
+	}
+	for name, rid := range cases {
+		t.Run(name, func(t *testing.T) {
+			wr, err := New(Cfg{BaseURI: testBaseURI, RequestID: rid})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodGet, "/api/v0/x", nil)
+			w := httptest.NewRecorder()
+
+			wr.Write(w, req, http.StatusNotFound, SlugNotFound, "nope")
+
+			var m map[string]json.RawMessage
+			if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if _, ok := m["reference"]; ok {
+				t.Fatalf("reference key must be omitted, body=%s", w.Body.String())
+			}
+		})
+	}
+}
+
+func TestWriteValidationIncludesReference(t *testing.T) {
+	wr, err := New(Cfg{
+		BaseURI:   testBaseURI,
+		RequestID: func(*http.Request) string { return "req-xyz" },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v0/x", nil)
+	w := httptest.NewRecorder()
+
+	wr.WriteValidation(w, req, "bad", FieldError{Pointer: "/qty", Detail: "too big"})
+
+	var got ValidationDetails
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Reference != "req-xyz" {
+		t.Fatalf("Reference = %q, want req-xyz", got.Reference)
+	}
+	if len(got.Errors) != 1 {
+		t.Fatalf("want 1 field error, got %d", len(got.Errors))
+	}
+}
