@@ -2,14 +2,11 @@ package middleware
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strconv"
-
-	"github.com/go-bumbu/http/lib/limitio"
 )
 
 // StatWriter is a wrapper to a httpResponse writer that allows to intercept and
@@ -19,28 +16,30 @@ type StatWriter struct {
 	statusCode    int
 	interceptBody bool // buffer body for non-200 responses
 	teeOnErr      bool // when true, also forward body to client (avoids hang on proxy copy)
-	buf           *limitio.LimitedBuf
+	buf           *limitBuf
 	headerWritten bool
 	bodyForwarded bool // true when body was written to client (via tee)
 	streaming     bool // true once the handler flushed: body interception is released
 	hijacked      bool // true once the connection was taken over by the handler
 }
 
+// bufMaxBytes caps how many bytes of an error response body are retained for
+// logging. It bounds per-request memory and log-line width; content past the cap
+// is dropped and flagged via limitBuf.Truncated.
+const bufMaxBytes = 2000
+
 // NewWriter returns a StatWriter. When interceptBody is true and status is an error
 // (>= 400, see IsStatusError), the body is buffered. If teeOnErr is also true, the body is also
 // forwarded to the client immediately (avoids hang when e.g. a reverse proxy copies the
 // response). When teeOnErr is false, only the buffer is written; the middleware must
-// write the body (e.g. when it will replace it with jsonErrors or genericErrs).
+// write the body (e.g. when it will replace it with genericErrs).
 func NewWriter(w http.ResponseWriter, interceptBody bool, teeOnErr bool) *StatWriter {
 	return &StatWriter{
 		ResponseWriter: w,
 		statusCode:     http.StatusOK,
 		interceptBody:  interceptBody,
 		teeOnErr:       teeOnErr,
-		buf: &limitio.LimitedBuf{
-			Buffer:   bytes.Buffer{},
-			MaxBytes: 2000,
-		},
+		buf:            newLimitBuf(bufMaxBytes),
 	}
 }
 
@@ -59,7 +58,7 @@ func (r *StatWriter) StatusCodeStr() string {
 // the handler has flushed, which releases interception so the response can stream.
 func (r *StatWriter) Write(b []byte) (int, error) {
 	if r.interceptBody && IsStatusError(r.statusCode) {
-		// Buffer for logging; ignore ErrBufferLimit since partial content is acceptable for logging
+		// Buffer for logging; excess bytes are silently dropped (observable via limitBuf.Truncated)
 		_, _ = r.buf.Write(b)
 		if r.teeOnErr || r.streaming {
 			n, err := r.ResponseWriter.Write(b)
@@ -186,7 +185,7 @@ func (r *StatWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 // the deferred status code.
 //
 // NOTE: content buffered beyond the buffer limit before the first flush is lost, since the
-// buffer is sized for logging. A handler writing more than limitio bufMaxBytes before its
+// buffer is sized for logging. A handler writing more than bufMaxBytes before its
 // first flush is not really streaming, so this is accepted.
 func (r *StatWriter) releaseInterception() {
 	if r.streaming {

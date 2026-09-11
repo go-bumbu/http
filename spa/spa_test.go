@@ -1,4 +1,4 @@
-package handlers
+package spa
 
 import (
 	"embed"
@@ -17,7 +17,7 @@ import (
 //go:embed testdata/ui/*
 var embedFs embed.FS
 
-func TestSpaHandler(t *testing.T) {
+func TestHandler(t *testing.T) {
 	tcs := []struct {
 		name    string
 		reqPath string
@@ -95,7 +95,7 @@ func TestSpaHandler(t *testing.T) {
 							req := httptest.NewRequest(http.MethodGet, joinPath, nil)
 							w := httptest.NewRecorder()
 
-							handler, err := NewSpaHAndler(
+							handler, err := NewHandler(
 								fileSystem,
 								tc.subDir,
 								pathPrefix,

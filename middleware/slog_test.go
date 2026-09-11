@@ -20,7 +20,6 @@ func TestSlogMiddleware(t *testing.T) {
 		name          string
 		statusCode    int
 		handlerMsg    string
-		genericErr    bool
 		expect        string
 		expectPayload string
 	}{
@@ -45,14 +44,6 @@ func TestSlogMiddleware(t *testing.T) {
 			expect:        "ERROR method=GET url=/metrics response-code=500 req-id= err-handlerMsg=my db broke down ",
 			expectPayload: "my db broke down",
 		},
-		{
-			name:          "non generic errors logged",
-			statusCode:    500,
-			genericErr:    true,
-			handlerMsg:    "my db broke down",
-			expect:        "ERROR method=GET url=/metrics response-code=500 req-id= err-handlerMsg=my db broke down ",
-			expectPayload: "Internal Server Error",
-		},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
@@ -60,8 +51,7 @@ func TestSlogMiddleware(t *testing.T) {
 			buf, logger := newMemSlog()
 
 			m := middleware.New(middleware.Cfg{
-				Logger:      logger,
-				GenericErrs: tc.genericErr,
+				Logger: logger,
 			})
 
 			handler := m.Middleware(th)
@@ -176,14 +166,14 @@ func testHandlerWithRespHeaders(body string, respHeaders map[string]string) http
 
 func TestLogHeaders(t *testing.T) {
 	tcs := []struct {
-		name               string
-		logHeaders         bool
-		extraRedact        []string
-		disableRedaction   bool
-		reqHeaders         map[string][]string
-		respHeaders        map[string]string
-		mustContain        []string
-		mustNotContain     []string
+		name             string
+		logHeaders       bool
+		extraRedact      []string
+		disableRedaction bool
+		reqHeaders       map[string][]string
+		respHeaders      map[string]string
+		mustContain      []string
+		mustNotContain   []string
 	}{
 		{
 			name:           "disabled by default — no debug line",
@@ -208,11 +198,11 @@ func TestLogHeaders(t *testing.T) {
 			mustNotContain: []string{"Bearer abc"},
 		},
 		{
-			name:        "ExtraRedactHeaders — case-insensitive match on added header",
-			logHeaders:  true,
-			extraRedact: []string{"x-tenant-secret"},
-			reqHeaders:  map[string][]string{"X-Tenant-Secret": {"super-secret"}},
-			mustContain: []string{"req-headers.X-Tenant-Secret=[REDACTED]"},
+			name:           "ExtraRedactHeaders — case-insensitive match on added header",
+			logHeaders:     true,
+			extraRedact:    []string{"x-tenant-secret"},
+			reqHeaders:     map[string][]string{"X-Tenant-Secret": {"super-secret"}},
+			mustContain:    []string{"req-headers.X-Tenant-Secret=[REDACTED]"},
 			mustNotContain: []string{"super-secret"},
 		},
 		{

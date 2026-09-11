@@ -24,7 +24,7 @@ license-check: ## check for invalid licenses
 COVERAGE_THRESHOLD ?= 70
 .PHONY: coverage
 coverage: ## check code coverage per package
-	@out=$$(go test -cover -covermode=atomic $$(go list ./lib/... ./middleware/... ./handlers/...)) || { echo "$$out"; exit 1; }; \
+	@out=$$(go test -cover -covermode=atomic $$(go list ./middleware/... ./spa/...)) || { echo "$$out"; exit 1; }; \
 	echo "$$out" | awk -v threshold=$(COVERAGE_THRESHOLD) ' \
 		/\[no test files\]/ { printf "⚠️  %-70s no test files\n", $$2; next } \
 		/coverage:/ { \

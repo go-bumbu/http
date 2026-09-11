@@ -1,4 +1,4 @@
-package handlers
+package spa
 
 import (
 	_ "embed"
@@ -9,36 +9,36 @@ import (
 	"strings"
 )
 
-// SpaHandler is a http handler capable of serving SPAs from a fs.FS ( tested are os.DirFS and embed.FS)
+// Handler is a http handler capable of serving SPAs from a fs.FS ( tested are os.DirFS and embed.FS)
 // configuration:
 // FsSubDir allows to keep more files that only the SPA in an FS and serve the data from a sub dir
 // Notice that the dir path needs to be relative and cannot be ./ or ../; empty string will be replaced by "."
 
-func NewSpaHAndler(inputFs fs.FS, fsSubDir, pathPrefix string) (SpaHandler, error) {
+func NewHandler(inputFs fs.FS, fsSubDir, pathPrefix string) (Handler, error) {
 	if inputFs == nil {
-		return SpaHandler{}, fmt.Errorf("fs cannot be nil")
+		return Handler{}, fmt.Errorf("fs cannot be nil")
 	}
 	if fsSubDir != "" {
 		newFs, err := fs.Sub(inputFs, fsSubDir)
 		if err != nil {
-			return SpaHandler{}, err
+			return Handler{}, err
 		}
 		inputFs = newFs
 	}
 
-	s := SpaHandler{
+	s := Handler{
 		fs:         inputFs,
 		pathPrefix: pathPrefix,
 	}
 	return s, nil
 }
 
-type SpaHandler struct {
+type Handler struct {
 	fs         fs.FS
 	pathPrefix string // if the SPA is served with a path prefix, e.g. "ui" in  http://my-app.com/ui/
 }
 
-func (h SpaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	reqPath := strings.TrimPrefix(r.URL.Path, h.pathPrefix)
 	if reqPath == "" || reqPath == "/" {

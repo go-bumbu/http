@@ -116,10 +116,9 @@ func TestPanicRecover_NoPanic(t *testing.T) {
 	}
 }
 
-func TestPanicRecover_BundledMiddlewareWithJSON(t *testing.T) {
+func TestPanicRecover_BundledMiddleware(t *testing.T) {
 	buf, logger := newMemSlog()
 	m := middleware.New(middleware.Cfg{
-		JsonErrors:   true,
 		PanicRecover: true,
 		Logger:       logger,
 	})
@@ -134,41 +133,11 @@ func TestPanicRecover_BundledMiddlewareWithJSON(t *testing.T) {
 		t.Errorf("expected 500, got %d", rec.Code)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, `"error"`) || !strings.Contains(body, `"code":500`) {
-		t.Errorf("expected JSON error envelope, got %q", body)
-	}
-	ct := rec.Header().Get("Content-Type")
-	if !strings.Contains(ct, "application/json") {
-		t.Errorf("expected application/json content-type, got %q", ct)
+	if body != http.StatusText(http.StatusInternalServerError) {
+		t.Errorf("expected generic status text body, got %q", body)
 	}
 	logOutput := buf.String()
 	if !strings.Contains(logOutput, "something went terribly wrong") {
 		t.Errorf("expected panic in log, got %q", logOutput)
 	}
 }
-
-func TestPanicRecover_ComposesWithJSONErrors(t *testing.T) {
-	_, logger := newMemSlog()
-	// JSONErrors wraps PanicRecover so the 500 from recovery gets intercepted as JSON.
-	handler := middleware.JSONErrors(false)(
-		middleware.PanicRecover(logger)(panicHandler()),
-	)
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/boom", nil)
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusInternalServerError {
-		t.Errorf("expected 500, got %d", rec.Code)
-	}
-	body := rec.Body.String()
-	if !strings.Contains(body, `"error"`) || !strings.Contains(body, `"code":500`) {
-		t.Errorf("expected JSON error envelope, got %q", body)
-	}
-
-	ct := rec.Header().Get("Content-Type")
-	if !strings.Contains(ct, "application/json") {
-		t.Errorf("expected application/json content-type, got %q", ct)
-	}
-}
-

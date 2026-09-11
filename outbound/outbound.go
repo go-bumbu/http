@@ -1,4 +1,4 @@
-// Package upstream is shared HTTP plumbing for a service's outbound calls to
+// Package outbound is shared HTTP plumbing for a service's outbound calls to
 // third-party HTTP APIs.
 //
 // It exists so every such client handles a flaky provider the same way:
@@ -8,7 +8,7 @@
 // naming the service (the UI). Callers map the error to a status code with
 // HTTPStatus and a message with UserMessage, so an upstream hiccup never
 // surfaces as a raw "status 500" to the user.
-package upstream
+package outbound
 
 import (
 	"context"

@@ -1,4 +1,4 @@
-package problem
+package problemjson
 
 import (
 	"encoding/json"
@@ -10,7 +10,7 @@ import (
 const testBaseURI = "https://example.test/probs"
 
 // stubUpstream satisfies UpstreamError without importing any client package —
-// exactly how a real *upstream.Error reaches WriteUpstream.
+// exactly how a real *outbound.Error reaches WriteUpstream.
 type stubUpstream struct {
 	status int
 	msg    string

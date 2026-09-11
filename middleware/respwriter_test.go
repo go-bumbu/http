@@ -12,7 +12,6 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -416,12 +415,8 @@ func TestStreaming_EndToEnd(t *testing.T) {
 	}{
 		{"responseController/tee/200", Cfg{}, http.StatusOK, false},
 		{"responseController/tee/503", Cfg{}, http.StatusServiceUnavailable, false},
-		{"responseController/jsonErrors/200", Cfg{JsonErrors: true}, http.StatusOK, false},
-		{"responseController/jsonErrors/503", Cfg{JsonErrors: true}, http.StatusServiceUnavailable, false},
-		{"responseController/genericErrs/503", Cfg{GenericErrs: true}, http.StatusServiceUnavailable, false},
 		{"legacyAssert/tee/200", Cfg{}, http.StatusOK, true},
 		{"legacyAssert/tee/503", Cfg{}, http.StatusServiceUnavailable, true},
-		{"legacyAssert/jsonErrors/503", Cfg{JsonErrors: true}, http.StatusServiceUnavailable, true},
 	}
 
 	const chunks = 3
@@ -462,8 +457,7 @@ func TestStreaming_ThroughReverseProxy(t *testing.T) {
 		status int
 	}{
 		{"tee/200", Cfg{}, http.StatusOK},
-		{"jsonErrors/200", Cfg{JsonErrors: true}, http.StatusOK},
-		{"jsonErrors/503", Cfg{JsonErrors: true}, http.StatusServiceUnavailable},
+		{"tee/503", Cfg{}, http.StatusServiceUnavailable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			const chunks = 3
@@ -498,7 +492,7 @@ func TestStreaming_ThroughReverseProxy(t *testing.T) {
 // once it is streamed.
 func TestStreaming_LargeBodyNotTruncated(t *testing.T) {
 	const size = 5000
-	m := New(Cfg{JsonErrors: true})
+	m := New(Cfg{})
 	srv := httptest.NewServer(m.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		rc := http.NewResponseController(w)
@@ -523,12 +517,12 @@ func TestStreaming_LargeBodyNotTruncated(t *testing.T) {
 }
 
 // TestStreaming_NestedStatWriters verifies that two stacked StatWriters (Logging wrapping
-// JSONErrors) compose: the outer writer's releaseInterception writes into the inner one,
+// Logging) compose: the outer writer's releaseInterception writes into the inner one,
 // which must not duplicate, drop, or envelope-wrap the streamed error body.
 func TestStreaming_NestedStatWriters(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	const chunks = 3
-	chain := Logging(logger)(JSONErrors(false)(streamHandler(t, http.StatusServiceUnavailable, chunks, false)))
+	chain := Logging(logger)(Logging(logger)(streamHandler(t, http.StatusServiceUnavailable, chunks, false)))
 	srv := httptest.NewServer(chain)
 	defer srv.Close()
 
@@ -628,72 +622,6 @@ func TestStatWriter_ReadFrom_InterceptsOnError(t *testing.T) {
 	}
 }
 
-// TestBodyReplacement_CorrectsContentLength is the regression test for the stale
-// Content-Length bug: when the middleware replaces an error body, a Content-Length set by
-// the handler (or copied from an upstream by a reverse proxy) described the ORIGINAL body.
-// Clients then failed the read with "unexpected EOF" and received nothing.
-func TestBodyReplacement_CorrectsContentLength(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// http.Error sets Content-Length for the original error page
-		http.Error(w, strings.Repeat("upstream detail ", 20), http.StatusBadGateway)
-	}))
-	defer upstream.Close()
-	u, err := url.Parse(upstream.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	directHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Length", "1000")
-		w.Header().Set("Content-Encoding", "gzip") // stale after replacement too
-		w.WriteHeader(http.StatusBadGateway)
-		_, _ = w.Write(make([]byte, 1000))
-	})
-
-	tests := []struct {
-		name     string
-		cfg      Cfg
-		handler  http.Handler
-		wantType string
-	}{
-		{"jsonErrors/direct", Cfg{JsonErrors: true}, directHandler, "application/json"},
-		{"genericErrs/direct", Cfg{GenericErrs: true}, directHandler, "text/plain"},
-		{"jsonErrors/reverseProxy", Cfg{JsonErrors: true}, httputil.NewSingleHostReverseProxy(u), "application/json"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			m := New(tc.cfg)
-			srv := httptest.NewServer(m.Middleware(tc.handler))
-			defer srv.Close()
-
-			resp, err := http.Get(srv.URL)
-			if err != nil {
-				t.Fatalf("get: %v", err)
-			}
-			defer func() { _ = resp.Body.Close() }()
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				t.Fatalf("client failed to read replaced body: %v", err)
-			}
-			if len(body) == 0 {
-				t.Fatal("client received an empty body")
-			}
-			if resp.StatusCode != http.StatusBadGateway {
-				t.Errorf("expected 502, got %d", resp.StatusCode)
-			}
-			if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, tc.wantType) {
-				t.Errorf("expected Content-Type %s, got %q", tc.wantType, got)
-			}
-			if got := resp.Header.Get("Content-Length"); got != strconv.Itoa(len(body)) {
-				t.Errorf("Content-Length %q does not match body length %d", got, len(body))
-			}
-			if resp.Header.Get("Content-Encoding") != "" {
-				t.Errorf("stale Content-Encoding must be removed, got %q", resp.Header.Get("Content-Encoding"))
-			}
-		})
-	}
-}
-
 // TestPanicRecover_ErrAbortHandlerPropagates is the regression test for swallowed aborts:
 // http.ErrAbortHandler is net/http's sentinel to cut the connection so the client detects
 // a truncated response (ReverseProxy panics with it when the upstream dies mid-copy).
@@ -772,7 +700,7 @@ func TestPanicRecover_RealPanicStillHandled(t *testing.T) {
 // sending 103 Early Hints before the real status must not have the 103 latched as the
 // final status (which made the real WriteHeader a no-op and reported 200 to the client).
 func TestStatWriter_EarlyHintsPassthrough(t *testing.T) {
-	m := New(Cfg{JsonErrors: true})
+	m := New(Cfg{})
 	srv := httptest.NewServer(m.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Link", "</style.css>; rel=preload")
 		w.WriteHeader(http.StatusEarlyHints)
@@ -794,7 +722,7 @@ func TestStatWriter_EarlyHintsPassthrough(t *testing.T) {
 // TestHijack_EndToEnd verifies a websocket-style upgrade through the middleware: the
 // handler obtains the connection, writes the raw response, and the middleware adds nothing.
 func TestHijack_EndToEnd(t *testing.T) {
-	m := New(Cfg{JsonErrors: true})
+	m := New(Cfg{})
 	srv := httptest.NewServer(m.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, brw, err := http.NewResponseController(w).Hijack()
 		if err != nil {

@@ -1,4 +1,4 @@
-package upstream
+package outbound
 
 import (
 	"context"
@@ -73,7 +73,7 @@ func TestGetGivesUpAfterMaxAttempts(t *testing.T) {
 	_, err := c.Get(context.Background(), srv.URL, nil)
 	var uerr *Error
 	if !errors.As(err, &uerr) {
-		t.Fatalf("want *upstream.Error, got %T: %v", err, err)
+		t.Fatalf("want *outbound.Error, got %T: %v", err, err)
 	}
 	if uerr.Kind != KindUnavailable || uerr.Status != http.StatusInternalServerError {
 		t.Fatalf("unexpected error: kind=%v status=%d", uerr.Kind, uerr.Status)
@@ -104,7 +104,7 @@ func TestGetHonoursRetryAfterOnRateLimit(t *testing.T) {
 	_, err := c.Get(context.Background(), srv.URL, nil)
 	var uerr *Error
 	if !errors.As(err, &uerr) {
-		t.Fatalf("want *upstream.Error, got %T: %v", err, err)
+		t.Fatalf("want *outbound.Error, got %T: %v", err, err)
 	}
 	if uerr.Kind != KindRateLimited {
 		t.Fatalf("kind = %v, want rate limited", uerr.Kind)
@@ -156,7 +156,7 @@ func TestGetDoesNotRetryRejectedRequest(t *testing.T) {
 	_, err := c.Get(context.Background(), srv.URL, nil)
 	var uerr *Error
 	if !errors.As(err, &uerr) {
-		t.Fatalf("want *upstream.Error, got %T: %v", err, err)
+		t.Fatalf("want *outbound.Error, got %T: %v", err, err)
 	}
 	if uerr.Kind != KindRejected {
 		t.Fatalf("kind = %v, want rejected", uerr.Kind)
@@ -175,7 +175,7 @@ func TestGetTransportFailureIsUnreachable(t *testing.T) {
 	_, err := c.Get(context.Background(), url, nil)
 	var uerr *Error
 	if !errors.As(err, &uerr) {
-		t.Fatalf("want *upstream.Error, got %T: %v", err, err)
+		t.Fatalf("want *outbound.Error, got %T: %v", err, err)
 	}
 	if uerr.Kind != KindUnreachable {
 		t.Fatalf("kind = %v, want unreachable", uerr.Kind)

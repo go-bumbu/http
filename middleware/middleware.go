@@ -9,13 +9,9 @@ import (
 	"runtime/debug"
 	"strings"
 	"time"
-
-	"github.com/go-bumbu/http/lib/limitio"
 )
 
 type Cfg struct {
-	JsonErrors   bool
-	GenericErrs  bool // print generic error messages instead of the actual one
 	PanicRecover bool
 	Logger       *slog.Logger
 	PromHisto    Histogram
@@ -40,8 +36,6 @@ type Cfg struct {
 
 func New(cfg Cfg) *Middleware {
 	m := Middleware{
-		jsonErrors:       cfg.JsonErrors,
-		genericErrs:      cfg.GenericErrs,
 		panicRecover:     cfg.PanicRecover,
 		hist:             cfg.PromHisto,
 		logger:           cfg.Logger,
@@ -52,22 +46,18 @@ func New(cfg Cfg) *Middleware {
 	return &m
 }
 
-// Middleware is intended perform common actions done by a production http server, it has several configuration flags:
-//   - JsonErrors: if set to true it will intercept all error responses (status >= 400, see IsStatusError),
-//     read the response error handlerMsg and wrap it into a json file, this is useful for APIs
-//   - GenericErrs: if set to true the error handlerMsg responded to the en user is a generic handlerMsg based on the
-//     response code instead of the original error handlerMsg, the original error will still be logged.
+// Middleware is intended perform common actions done by a production http server. It wraps a
+// handler to add request logging, prometheus metrics, and panic recovery. It never modifies the
+// response body: error responses (>= 400) are forwarded to the client and their bodies captured
+// for logging.
 //
-// NOTE: both JsonErrors and GenericErrs only intercept error responses (>= 400). Success codes like
-// 200, 204, 206 etc. pass through unmodified, as do 1xx informational responses.
-// Handlers that stream (flush before the response is complete) or hijack the connection
-// are never modified.
+// NOTE: Success codes like 200, 204, 206 etc. pass through unmodified, as do 1xx informational
+// responses. Handlers that stream (flush before the response is complete) or hijack the
+// connection are never modified.
 //
 //   - Histogram: use NewPromHistogram to create an histogram used to capture prometheus metrics about every request
 //     if left empty, no prometheus metric will be captured
 type Middleware struct {
-	jsonErrors       bool
-	genericErrs      bool
 	panicRecover     bool
 	hist             Histogram
 	logger           *slog.Logger
@@ -80,10 +70,9 @@ type Middleware struct {
 func (c *Middleware) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		timeStart := time.Now()
-		// teeOnErr: when we won't modify the body (no genericErrs, no jsonErrors), tee so the
-		// client receives it during e.g. reverse proxy copy—avoids indefinite hang on 401.
-		teeOnErr := !c.genericErrs && !c.jsonErrors
-		respWriter := NewWriter(w, true, teeOnErr)
+		// The middleware never modifies the body; tee error responses so the client still
+		// receives them during e.g. a reverse-proxy copy—avoids an indefinite hang on 401.
+		respWriter := NewWriter(w, true, true)
 
 		if c.panicRecover {
 			defer func() {
@@ -147,26 +136,13 @@ func (c *Middleware) finalize(r *http.Request, respWriter *StatWriter, timeStart
 	c.log(r, respWriter.StatusCode(), errMsg, timeDiff)
 	c.logHeadersDebug(r, respWriter.Header())
 
-	if c.genericErrs {
-		errMsg = http.StatusText(respWriter.StatusCode())
-	}
-
-	if respWriter.canReplaceBody() {
-		if c.jsonErrors {
-			b := jsonErrBytes(errMsg, respWriter.StatusCode())
-			writeReplacementBody(respWriter, "application/json", b)
-		} else {
-			writeReplacementBody(respWriter, "text/plain", []byte(errMsg))
-		}
-	} else {
-		respWriter.flushHeader()
-	}
+	respWriter.flushHeader()
 
 	c.observe(r, respWriter.StatusCode(), timeDiff)
 }
 
 // getErrMsg returns the error handlerMsg in case of an error response or empty string
-func (c *Middleware) getErrMsg(code int, buf *limitio.LimitedBuf) string {
+func (c *Middleware) getErrMsg(code int, buf *limitBuf) string {
 	if !IsStatusError(code) {
 		return ""
 	}

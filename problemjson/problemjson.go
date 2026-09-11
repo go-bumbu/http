@@ -1,4 +1,4 @@
-// Package problem writes RFC 9457 ("Problem Details for HTTP APIs")
+// Package problemjson writes RFC 9457 ("Problem Details for HTTP APIs")
 // application/problem+json responses.
 //
 // It replaces ad-hoc {"error":..., "code":...} error shapes with one
@@ -15,7 +15,7 @@
 // middleware, which is a catch-all that rewraps bare error responses; a given
 // route group should use one or the other, not both (a middleware that rewraps
 // bodies would otherwise double-encode this package's problem+json).
-package problem
+package problemjson
 
 import (
 	"encoding/json"
@@ -111,7 +111,7 @@ type Writer struct {
 // base URI is a namespace only the caller owns, so there is no sane default.
 func New(cfg Cfg) (*Writer, error) {
 	if cfg.BaseURI == "" {
-		return nil, errors.New("problem: Cfg.BaseURI is required")
+		return nil, errors.New("problemjson: Cfg.BaseURI is required")
 	}
 	titles := make(map[string]string, len(defaultTitles)+len(cfg.Titles))
 	for slug, title := range defaultTitles {
