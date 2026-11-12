@@ -128,15 +128,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		if m.panicRecover {
 			defer func() {
 				if rec := recover(); rec != nil {
-					if isAbort(rec) {
-						// net/http's sentinel to abort the response so the client
-						// sees a truncated reply (ReverseProxy panics with it when
-						// the upstream dies mid-copy). Swallowing it would make the
-						// truncated response look complete; hand it back to net/http.
-						m.observe(r, slot, respWriter.StatusCode(), time.Since(timeStart))
-						panic(rec)
-					}
-					m.handlePanic(r, respWriter, rec, debug.Stack())
+					m.recovered(r, slot, respWriter, timeStart, rec)
 				}
 				m.finalize(r, slot, respWriter, timeStart)
 			}()
@@ -150,6 +142,26 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 	})
 }
 
+// recovered handles a panic recovered from the handler. It returns normally only when it
+// turned the panic into a 500 response; otherwise it re-panics with http.ErrAbortHandler after
+// recording the request.
+func (m *Middleware) recovered(r *http.Request, slot *routeSlot, respWriter *StatWriter, timeStart time.Time, rec any) {
+	if isAbort(rec) {
+		// net/http's sentinel to abort the response so the client sees a truncated reply
+		// (ReverseProxy panics with it when the upstream dies mid-copy). Swallowing it would
+		// make the truncated response look complete; hand it back to net/http.
+		m.observe(r, slot, respWriter.StatusCode(), time.Since(timeStart))
+		panic(rec)
+	}
+	if !m.handlePanic(r, respWriter, rec, debug.Stack()) {
+		// The response had started: the client already holds a status and maybe part of the
+		// body. Finishing normally would make the truncated reply look complete, so record it
+		// and abort the connection, as net/http does for an unrecovered panic.
+		m.finalize(r, slot, respWriter, timeStart)
+		panic(http.ErrAbortHandler)
+	}
+}
+
 // isAbort reports whether a recovered panic value is http.ErrAbortHandler, the stdlib
 // sentinel that means "abort this response, let the client detect the truncation".
 func isAbort(rec any) bool {
@@ -158,10 +170,11 @@ func isAbort(rec any) bool {
 }
 
 // handlePanic logs a recovered panic and, when the response has not started, turns it into a
-// 500 response. http.ErrAbortHandler must not reach here (see isAbort): it is the stdlib's
-// sentinel for deliberately aborting the response so the client detects truncation; recovering
-// it would make a truncated reply look complete.
-func (m *Middleware) handlePanic(r *http.Request, respWriter *StatWriter, rec any, stack []byte) {
+// 500 response and returns true. It returns false when the response had already started; the
+// caller must then abort the connection so the client detects the truncation.
+// http.ErrAbortHandler must not reach here (see isAbort): it is the stdlib's sentinel for
+// deliberately aborting the response; recovering it would make a truncated reply look complete.
+func (m *Middleware) handlePanic(r *http.Request, respWriter *StatWriter, rec any, stack []byte) bool {
 	if m.logger != nil {
 		m.logger.LogAttrs(r.Context(), slog.LevelError, "panic recovered",
 			slog.String("method", r.Method),
@@ -176,10 +189,11 @@ func (m *Middleware) handlePanic(r *http.Request, respWriter *StatWriter, rec an
 	// error text would corrupt that response under its already-sent status, exactly as
 	// net/http declines to do.
 	if respWriter.Streaming() || respWriter.Started() {
-		return
+		return false
 	}
 	respWriter.WriteHeader(http.StatusInternalServerError)
 	_, _ = respWriter.Write([]byte(http.StatusText(http.StatusInternalServerError)))
+	return true
 }
 
 func (m *Middleware) finalize(r *http.Request, slot *routeSlot, respWriter *StatWriter, timeStart time.Time) {
