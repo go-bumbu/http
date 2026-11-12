@@ -81,9 +81,13 @@ Prometheus client, so importing `middleware` alone stays dependency-free.
 
 Metrics are labelled by route template (`/users/{id}`), never by raw path, so
 `/users/1` and `/users/2` share one series. The middleware resolves the route after the
-handler runs: a route reported with `middleware.SetRoute`, else one reported by
-`middleware.CaptureRoute`, else the `http.ServeMux` pattern; anything else records as
-`unmatched`.
+handler runs, by one rule: the innermost reporter wins. A reporter is a
+`middleware.SetRoute` call or a `middleware.CaptureRoute` whose mux matched, and
+"innermost" means nested inside the most `CaptureRoute`s, whether it reports before or
+after the handler. At equal depth `SetRoute` wins; empty reports (a mux miss,
+`SetRoute(r, "")`) are ignored. With no report the middleware uses the `http.ServeMux`
+pattern it sees; anything else records as `unmatched`. `Cfg.RouteGroups` is applied to
+the result.
 
 With `http.ServeMux` directly under the middleware nothing is needed. When another
 wrapper sits in between and passes a request copy down (`r.WithContext` in an auth or
@@ -95,10 +99,18 @@ records as `unmatched`. Wrap the mux in `CaptureRoute`, directly around it:
 http.ListenAndServe(":8080", m.Wrap(auth(middleware.CaptureRoute(mux))))
 ```
 
-For a mux mounted under another with `http.StripPrefix`, wrap the inner mux: the
-innermost `CaptureRoute` whose mux matched wins over the outer prefix (`/api/`), and
-`SetRoute` wins over both. The inner pattern is relative to the stripped path
-(`GET /users/{id}`, not `/api/users/{id}`).
+For a mux mounted under another router or mux with `http.StripPrefix`, wrap the inner
+mux in `CaptureRoute`: its pattern wins over the outer template (`/api/`, gorilla's
+`/api/{version}/`, chi's `/api/*`), and the outer one is kept when the inner mux has no
+match. The inner pattern is relative to the stripped path (`GET /users/{id}`, not
+`/api/users/{id}`), so mounting the same mux under `/v1` and `/v2` shares its series.
+To keep the full path, register the inner mux with full patterns
+(`GET /api/users/{id}`) and skip `StripPrefix`.
+
+This rule changed label values in mixed router setups: an outer `SetRoute` used to win
+over an inner `CaptureRoute`, so such routes now record the inner, relative pattern
+instead of the outer template. Check dashboards and `RouteGroups` after upgrading: an
+`/api` group does not match a relative inner pattern like `GET /users/{id}`.
 
 Other routers report their match with `SetRoute`, from a router-level middleware.
 gorilla/mux:
@@ -159,7 +171,9 @@ Notes:
 `Cfg.RouteGroups` collapses routes under a prefix into one series:
 `RouteGroups: []string{"/api"}` records `GET /api/apple` and `GET /api/banana` as
 `GET /api`. Entries are paths (a method is stripped, a host is not supported); they
-match whole segments (`/api` does not group `/apiary`) and the longest wins.
+match whole segments (`/api` does not group `/apiary`) and the longest wins. Groups
+match the resolved route, so a relative pattern from an inner `CaptureRoute`
+(`GET /users/{id}` under a stripped `/api`) is not in an `/api` group.
 
 ### spa
 

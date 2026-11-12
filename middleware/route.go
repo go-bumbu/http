@@ -96,8 +96,14 @@ func (m *Middleware) withRouteSlot(r *http.Request) (*http.Request, *routeSlot, 
 // the request finishes.
 //
 // Pass a route template such as "/users/{id}", never the raw request path: every distinct
-// value becomes its own metric series. SetRoute is a no-op on a request that did not pass
-// through a Middleware with metrics enabled.
+// value becomes its own metric series. An empty route is no report: it is ignored, so it
+// neither clears nor shadows a route reported elsewhere. SetRoute is a no-op on a request
+// that did not pass through a Middleware with metrics enabled.
+//
+// When several report a route, the innermost reporter wins: the one nested inside the most
+// CaptureRoutes, whether it reports before or after the handler runs. At equal depth SetRoute
+// beats a CaptureRoute, and between two SetRoute calls the later one wins. With no report the
+// Middleware falls back to r.Pattern, then applies Cfg.RouteGroups to the result.
 func SetRoute(r *http.Request, route string) {
 	sc := scopeOf(r)
 	if sc == nil || route == "" {
@@ -120,12 +126,15 @@ func SetRoute(r *http.Request, route string) {
 // Middleware never sees, so without CaptureRoute such a route records as unmatched. Place it
 // directly around the mux: m.Wrap(auth(middleware.CaptureRoute(mux))).
 //
-// When several report a route, the innermost wins: a SetRoute or CaptureRoute (whose mux
-// matched) nested inside more CaptureRoutes beats an outer one, a SetRoute beats a capture at
-// the same depth, and either beats the pattern the Middleware itself sees. So
-// with a mux mounted under another through http.StripPrefix, wrap the inner mux to record its
-// pattern rather than the outer prefix ("/api/"). The inner pattern is relative to the
-// stripped path ("GET /users/{id}", not "/api/users/{id}").
+// When several report a route, the innermost reporter wins: a SetRoute or a CaptureRoute
+// whose mux matched, nested inside more CaptureRoutes, beats an outer one; at equal depth
+// SetRoute wins; empty reports (a mux miss, SetRoute with "") are ignored; with no report the
+// Middleware uses r.Pattern; Cfg.RouteGroups is applied after. So with a mux mounted under
+// another router or mux through http.StripPrefix, wrapping the inner mux records its pattern
+// rather than the outer template ("/api/{version}/"), and the outer one is kept when the
+// inner mux has no match. The inner pattern is relative to the stripped path
+// ("GET /users/{id}", not "/api/users/{id}"); to keep the full path, register the inner mux
+// with full patterns and skip StripPrefix.
 //
 // Around an *http.ServeMux, CaptureRoute looks the pattern up (ServeMux.Handler) before
 // dispatching, so the route is recorded even when http.TimeoutHandler times out and the
@@ -160,8 +169,10 @@ func CaptureRoute(mux http.Handler) http.Handler {
 }
 
 // Route returns the route an Observer should record for r: the route the Middleware
-// resolved (the innermost SetRoute or CaptureRoute, else r.Pattern, then Cfg.RouteGroups), or "" when
-// no route matched. On a request that did not pass through a Middleware it returns r.Pattern.
+// resolved, or "" when no route matched. The innermost non-empty report wins (SetRoute or
+// CaptureRoute, SetRoute at equal depth), else r.Pattern, then Cfg.RouteGroups is applied.
+// On a request that did not pass through a Middleware with metrics enabled it returns
+// r.Pattern.
 func Route(r *http.Request) string {
 	sc := scopeOf(r)
 	if sc == nil {
@@ -179,8 +190,9 @@ func Route(r *http.Request) string {
 }
 
 // resolveRoute settles the route for r, after the handler has run, and stores it in the
-// slot for Route to return: the innermost SetRoute or CaptureRoute, else r.Pattern, then mapped through
-// the route groups. Each nested Middleware resolves from the raw sources with its own groups.
+// slot for Route to return: the innermost non-empty report (SetRoute or CaptureRoute,
+// SetRoute at equal depth), else r.Pattern, then mapped through the route groups. Each
+// nested Middleware resolves from the raw sources with its own groups.
 func (m *Middleware) resolveRoute(r *http.Request, s *routeSlot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
