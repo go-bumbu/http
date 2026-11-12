@@ -540,6 +540,7 @@ func TestPanicRecover_ErrAbortHandlerPropagates(t *testing.T) {
 	if readErr == nil {
 		t.Error("expected a read error signalling truncation, got clean EOF")
 	}
+	srv.Close() // waits for the handler, which logs the request before re-panicking
 	if strings.Contains(logBuf.String(), "panic recovered") {
 		t.Error("ErrAbortHandler must not be logged as a recovered panic")
 	}
