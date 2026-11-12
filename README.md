@@ -197,10 +197,18 @@ This is the only package that pulls in `golang.org/x/time/rate`; the inbound pac
 Writes RFC 9457 (`application/problem+json`) error responses — one consistent,
 spec-shaped error body (a stable `type` URI, `title`/`detail`, and the request path
 as `instance`) in place of ad-hoc `{"error":...}` shapes. `ModeMasked` strips
-handler-supplied detail in production while keeping a correlation `reference`.
+handler-supplied detail in production while keeping a correlation `reference`; set
+`OnProblem` to log the unmasked details (same `reference`) so the real cause is not lost.
 
 ```go
-pj, err := problemjson.New(problemjson.Cfg{BaseURI: "https://errors.example.com"})
+pj, err := problemjson.New(problemjson.Cfg{
+	BaseURI:   "https://errors.example.com",
+	Mode:      problemjson.ModeMasked,
+	RequestID: requestIDFrom, // func(*http.Request) string
+	OnProblem: func(r *http.Request, d problemjson.Details) {
+		slog.Error("problem", "status", d.Status, "detail", d.Detail, "reference", d.Reference)
+	},
+})
 // handle err
 pj.Write(w, r, http.StatusNotFound, problemjson.SlugNotFound, "no such release")
 pj.WriteUpstream(w, r, err, "The catalog is unavailable.") // maps an outbound.*Error

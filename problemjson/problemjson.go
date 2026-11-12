@@ -35,7 +35,8 @@ const (
 	// ModeMasked strips the detail and validation fields and replaces the
 	// type/title with a generic identity (SlugMasked), leaving only the HTTP
 	// status, the request instance, and the correlation reference. Use it in
-	// production so internal specifics never reach the client.
+	// production so internal specifics never reach the client; set
+	// Cfg.OnProblem to log the unmasked Details the reference points at.
 	ModeMasked
 )
 
@@ -87,7 +88,8 @@ type Details struct {
 	Instance string `json:"instance,omitempty"`
 	// Reference is a caller-supplied correlation id (RFC 9457 extension member,
 	// from Cfg.RequestID), emitted in both modes when non-empty so a masked
-	// response can still be traced to its real detail in logs.
+	// response can be matched to the unmasked Details passed to Cfg.OnProblem
+	// (which the caller logs).
 	Reference string `json:"reference,omitempty"`
 }
 
@@ -146,12 +148,20 @@ type Cfg struct {
 	// RequestID, when set, is called per response to obtain a correlation
 	// reference (typically the caller's request-id / trace-id from context or
 	// a header). Its non-empty result is written to Details.Reference so a
-	// masked client-facing error can still be traced to the real detail in
-	// logs. Return "" (or leave RequestID nil) to omit the reference.
+	// masked client-facing error can be matched to the unmasked Details that
+	// OnProblem receives. Return "" (or leave RequestID nil) to omit the
+	// reference.
 	RequestID func(*http.Request) string
 	// Mode selects verbose (ModeDev, the zero value) vs masked (ModeMasked)
 	// rendering for every response this Writer emits.
 	Mode Mode
+	// OnProblem, when set, is called once per response, in every mode and from
+	// every Write method, with the full unmasked Details (including Reference)
+	// before any masking and before the body is written. It is the hook that
+	// keeps a ModeMasked response traceable: log the Details here and the
+	// reference the client sees points at the real detail. Validation field
+	// errors and the upstream reason are not included. Nil means no hook.
+	OnProblem func(r *http.Request, d Details)
 }
 
 // Writer emits problem+json responses for one base URI and title set.
@@ -160,6 +170,7 @@ type Writer struct {
 	titles    map[string]string
 	requestID func(*http.Request) string
 	mode      Mode
+	onProblem func(*http.Request, Details)
 }
 
 // New returns a Writer configured by cfg. It errors when BaseURI is empty: the
@@ -180,6 +191,7 @@ func New(cfg Cfg) (*Writer, error) {
 		titles:    titles,
 		requestID: cfg.RequestID,
 		mode:      cfg.Mode,
+		onProblem: cfg.OnProblem,
 	}, nil
 }
 
@@ -189,7 +201,7 @@ func New(cfg Cfg) (*Writer, error) {
 // re-reading its own request.
 // Under ModeMasked the type and title are replaced with the generic
 // SlugMasked identity and detail is omitted; a non-empty reference is
-// included in both modes.
+// included in both modes, and Cfg.OnProblem receives the unmasked Details.
 func (wr *Writer) Write(w http.ResponseWriter, r *http.Request, status int, slug, detail string) {
 	d := Details{
 		Type:      wr.TypeURI(slug),
@@ -199,6 +211,7 @@ func (wr *Writer) Write(w http.ResponseWriter, r *http.Request, status int, slug
 		Instance:  r.URL.Path,
 		Reference: wr.reference(r),
 	}
+	wr.notify(r, d)
 	if wr.mode == ModeMasked {
 		d = wr.mask(d)
 	}
@@ -219,6 +232,7 @@ func (wr *Writer) WriteValidation(w http.ResponseWriter, r *http.Request, detail
 		Instance:  r.URL.Path,
 		Reference: wr.reference(r),
 	}
+	wr.notify(r, d)
 	if wr.mode == ModeMasked {
 		writeProblem(w, status, wr.mask(d))
 		return
@@ -264,6 +278,7 @@ func (wr *Writer) WriteUpstream(w http.ResponseWriter, r *http.Request, err erro
 					Instance:  r.URL.Path,
 					Reference: wr.reference(r),
 				}
+				wr.notify(r, d)
 				writeProblem(w, status, upstreamDetails{Details: d, Reason: reason})
 				return
 			}
@@ -299,6 +314,13 @@ func (wr *Writer) mask(d Details) Details {
 		Status:    d.Status,
 		Instance:  d.Instance,
 		Reference: d.Reference,
+	}
+}
+
+// notify hands the unmasked d to the OnProblem hook, if one is configured.
+func (wr *Writer) notify(r *http.Request, d Details) {
+	if wr.onProblem != nil {
+		wr.onProblem(r, d)
 	}
 }
 

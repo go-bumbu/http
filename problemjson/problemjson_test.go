@@ -562,3 +562,111 @@ func TestMaskedWriteUpstreamOmitsReason(t *testing.T) {
 		t.Fatalf("masked mode must not include detail, body=%s", w.Body.String())
 	}
 }
+
+// TestOnProblemReceivesUnmaskedDetails pins that a masked response stays
+// traceable: OnProblem sees the real detail on every write path while the
+// client body stays masked, and both carry the same reference.
+func TestOnProblemReceivesUnmaskedDetails(t *testing.T) {
+	type call struct {
+		path string
+		d    Details
+	}
+	var calls []call
+	wr, err := New(Cfg{
+		BaseURI:   testBaseURI,
+		Mode:      ModeMasked,
+		RequestID: func(r *http.Request) string { return "ref-" + r.URL.Path },
+		OnProblem: func(r *http.Request, d Details) { calls = append(calls, call{r.URL.Path, d}) },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		write      func(w http.ResponseWriter, r *http.Request)
+		wantStatus int
+		wantSlug   string
+		wantDetail string
+	}{
+		{
+			name: "Write",
+			write: func(w http.ResponseWriter, r *http.Request) {
+				wr.Write(w, r, http.StatusInternalServerError, SlugInternal, "db: connection refused")
+			},
+			wantStatus: http.StatusInternalServerError, wantSlug: SlugInternal, wantDetail: "db: connection refused",
+		},
+		{
+			name: "WriteValidation",
+			write: func(w http.ResponseWriter, r *http.Request) {
+				wr.WriteValidation(w, r, "too many items", FieldError{Pointer: "/items", Detail: "max 10"})
+			},
+			wantStatus: http.StatusUnprocessableEntity, wantSlug: SlugValidationError, wantDetail: "too many items",
+		},
+		{
+			name: "WriteUpstream",
+			write: func(w http.ResponseWriter, r *http.Request) {
+				wr.WriteUpstream(w, r, stubUpstreamReason{
+					stubUpstream: stubUpstream{status: http.StatusGatewayTimeout, msg: "provider slow"},
+					reason:       "timeout",
+				}, "fallback")
+			},
+			wantStatus: http.StatusGatewayTimeout, wantSlug: SlugUpstreamTimeout, wantDetail: "provider slow",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			calls = nil
+			path := "/api/v0/" + tc.name
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			w := httptest.NewRecorder()
+
+			tc.write(w, req)
+
+			var body Details
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode: %v; body=%s", err, w.Body.String())
+			}
+			if body.Detail != "" || Slug(body.Type) != SlugMasked {
+				t.Fatalf("body not masked: %+v", body)
+			}
+			if len(calls) != 1 {
+				t.Fatalf("OnProblem called %d times, want 1", len(calls))
+			}
+			got := calls[0]
+			want := Details{
+				Type:      testBaseURI + "/" + tc.wantSlug,
+				Title:     wr.TitleFor(tc.wantSlug),
+				Status:    tc.wantStatus,
+				Detail:    tc.wantDetail,
+				Instance:  path,
+				Reference: "ref-" + path,
+			}
+			if got.path != path || got.d != want {
+				t.Fatalf("OnProblem got (%s, %+v), want (%s, %+v)", got.path, got.d, path, want)
+			}
+			if got.d.Reference != body.Reference {
+				t.Fatalf("hook reference %q != response reference %q", got.d.Reference, body.Reference)
+			}
+		})
+	}
+}
+
+// TestOnProblemDevModeCalledOnce pins that the hook also fires in dev mode,
+// exactly once even on WriteUpstream's reason path.
+func TestOnProblemDevModeCalledOnce(t *testing.T) {
+	n := 0
+	wr, err := New(Cfg{BaseURI: testBaseURI, OnProblem: func(*http.Request, Details) { n++ }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	wr.WriteUpstream(httptest.NewRecorder(), req, stubUpstreamReason{
+		stubUpstream: stubUpstream{status: http.StatusBadGateway, msg: "down"},
+		reason:       "unreachable",
+	}, "fallback")
+	wr.WriteUpstream(httptest.NewRecorder(), req, stubUpstream{status: http.StatusBadGateway, msg: "down"}, "fallback")
+	if n != 2 {
+		t.Fatalf("OnProblem called %d times for two writes, want 2", n)
+	}
+}
