@@ -73,11 +73,27 @@ Prometheus client, so importing `middleware` alone stays dependency-free.
 
 Metrics are labelled by route template (`/users/{id}`), never by raw path, so
 `/users/1` and `/users/2` share one series. The middleware resolves the route after the
-handler runs: a route reported with `middleware.SetRoute`, else the `http.ServeMux`
-pattern; anything else records as `unmatched`.
+handler runs: a route reported with `middleware.SetRoute`, else one reported by
+`middleware.CaptureRoute`, else the `http.ServeMux` pattern; anything else records as
+`unmatched`.
 
-With `http.ServeMux` nothing is needed. Other routers report their match with
-`SetRoute`, from a router-level middleware. gorilla/mux:
+With `http.ServeMux` directly under the middleware nothing is needed. When another
+wrapper sits in between and passes a request copy down (`r.WithContext` in an auth or
+tracing middleware, `http.TimeoutHandler`, `http.MaxBytesHandler`, `http.StripPrefix`),
+the mux writes its pattern onto a copy the middleware never sees, and every request
+records as `unmatched`. Wrap the mux in `CaptureRoute`, directly around it:
+
+```go
+http.ListenAndServe(":8080", m.Wrap(auth(middleware.CaptureRoute(mux))))
+```
+
+For a mux mounted under another with `http.StripPrefix`, wrap the inner mux: the
+innermost `CaptureRoute` whose mux matched wins over the outer prefix (`/api/`), and
+`SetRoute` wins over both. The inner pattern is relative to the stripped path
+(`GET /users/{id}`, not `/api/users/{id}`).
+
+Other routers report their match with `SetRoute`, from a router-level middleware.
+gorilla/mux:
 
 ```go
 // Reports gorilla's matched template. gorilla runs Use middlewares after matching.
@@ -128,9 +144,6 @@ Notes:
 - Route shapes differ by router: a `ServeMux` pattern keeps its method when registered
   with one (`GET /users/{id}`), a gorilla or chi template has none (`/users/{id}`). The
   method is always its own label as well.
-- A wrapper that copies the request between the middleware and a `ServeMux`
-  (`http.StripPrefix`, `http.TimeoutHandler`) hides the pattern from the middleware;
-  report the route with `SetRoute` instead.
 - With metrics on, handlers receive a copy of the request. The middleware copies
   `r.Pattern` back for wrappers outside it, but not the path values: `r.PathValue` is
   empty outside the middleware.

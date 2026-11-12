@@ -18,7 +18,20 @@ type routeKey struct{}
 type routeSlot struct {
 	mu       sync.Mutex
 	set      string // from SetRoute
+	captured string // from the innermost CaptureRoute whose ServeMux matched
 	resolved string // final route, written by the Middleware before it calls the Observer
+}
+
+// source returns the reported route: SetRoute, else CaptureRoute, else pattern.
+// The caller holds s.mu.
+func (s *routeSlot) source(pattern string) string {
+	if s.set != "" {
+		return s.set
+	}
+	if s.captured != "" {
+		return s.captured
+	}
+	return pattern
 }
 
 func noRestore() {}
@@ -58,9 +71,45 @@ func SetRoute(r *http.Request, route string) {
 	}
 }
 
+// CaptureRoute reports the pattern of the http.ServeMux it wraps, for setups where another
+// wrapper sits between the Middleware and the mux and passes a request copy down
+// (r.WithContext in an auth or tracing middleware, http.TimeoutHandler, http.MaxBytesHandler,
+// http.StripPrefix). ServeMux writes r.Pattern onto the copy it receives, which the
+// Middleware never sees, so without CaptureRoute such a route records as unmatched. Place it
+// directly around the mux: m.Wrap(auth(middleware.CaptureRoute(mux))).
+//
+// When several report a route, the most specific wins: a route set with SetRoute, else the
+// innermost CaptureRoute whose mux matched, else the pattern the Middleware itself sees. So
+// with a mux mounted under another through http.StripPrefix, wrap the inner mux to record its
+// pattern rather than the outer prefix ("/api/"). The inner pattern is relative to the
+// stripped path ("GET /users/{id}", not "/api/users/{id}"). CaptureRoute reports the pattern
+// even if the handler panics, and is a no-op on a request that did not pass through a
+// Middleware with metrics enabled.
+func CaptureRoute(mux http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s, ok := r.Context().Value(routeKey{}).(*routeSlot)
+		if !ok {
+			mux.ServeHTTP(w, r)
+			return
+		}
+		defer func() {
+			if r.Pattern == "" {
+				return
+			}
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			// An inner CaptureRoute returns first: keep its more specific pattern.
+			if s.captured == "" {
+				s.captured = r.Pattern
+			}
+		}()
+		mux.ServeHTTP(w, r)
+	})
+}
+
 // Route returns the route an Observer should record for r: the route the Middleware
-// resolved (SetRoute, else r.Pattern, then Cfg.RouteGroups), or "" when no route matched.
-// On a request that did not pass through a Middleware it returns r.Pattern.
+// resolved (SetRoute, else CaptureRoute, else r.Pattern, then Cfg.RouteGroups), or "" when
+// no route matched. On a request that did not pass through a Middleware it returns r.Pattern.
 func Route(r *http.Request) string {
 	s, ok := r.Context().Value(routeKey{}).(*routeSlot)
 	if !ok {
@@ -69,27 +118,20 @@ func Route(r *http.Request) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Grouping never empties a route, so an empty resolved value means nothing resolved yet
-	// or nothing matched; either way the raw sources below give the right answer.
+	// or nothing matched; either way the raw sources give the right answer.
 	if s.resolved != "" {
 		return s.resolved
 	}
-	if s.set != "" {
-		return s.set
-	}
-	return r.Pattern
+	return s.source(r.Pattern)
 }
 
 // resolveRoute settles the route for r, after the handler has run, and stores it in the
-// slot for Route to return: SetRoute, else r.Pattern, then mapped through the route groups.
-// Each nested Middleware resolves from the raw sources with its own groups.
+// slot for Route to return: SetRoute, else CaptureRoute, else r.Pattern, then mapped through
+// the route groups. Each nested Middleware resolves from the raw sources with its own groups.
 func (m *Middleware) resolveRoute(r *http.Request, s *routeSlot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	route := s.set
-	if route == "" {
-		route = r.Pattern
-	}
-	s.resolved = m.routeGroups.apply(route)
+	s.resolved = m.routeGroups.apply(s.source(r.Pattern))
 }
 
 // routeGroups is a list of path prefixes, longest first, that collapse every route beneath

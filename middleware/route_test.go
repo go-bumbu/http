@@ -278,6 +278,74 @@ func TestRoute_OutsideMiddleware(t *testing.T) {
 	}
 }
 
+type ctxKey struct{}
+
+// withContext stands in for an auth/tracing middleware: it passes a request copy down, so
+// the pattern ServeMux writes onto that copy never reaches the Middleware's request.
+func withContext(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, "v")))
+	})
+}
+
+// TestRoute_CaptureRoute covers a request-copying wrapper between the Middleware and a
+// ServeMux: without CaptureRoute the pattern is lost (or the outer, less specific one is
+// recorded); CaptureRoute directly around each mux reports it, and the innermost wins.
+func TestRoute_CaptureRoute(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.Handle("GET /users/{id}", testHandler(200, "ok"))
+	mux.Handle("GET /boom", http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("boom") }))
+
+	inner := http.NewServeMux()
+	inner.Handle("GET /users/{id}", testHandler(200, "ok"))
+	inner.Handle("GET /explicit", setRoute("/api/explicit"))
+	nested := func(capture bool) http.Handler {
+		var h http.Handler = inner
+		if capture {
+			h = middleware.CaptureRoute(inner)
+		}
+		outer := http.NewServeMux()
+		outer.Handle("/api/", http.StripPrefix("/api", h))
+		return outer
+	}
+
+	tcs := []struct {
+		name   string
+		cfg    middleware.Cfg
+		h      http.Handler
+		target string
+		want   string
+	}{
+		{name: "copy hides the pattern", h: withContext(mux), target: "/users/1", want: ""},
+		{name: "WithContext", h: withContext(middleware.CaptureRoute(mux)), target: "/users/1", want: "GET /users/{id}"},
+		{name: "TimeoutHandler", h: http.TimeoutHandler(middleware.CaptureRoute(mux), time.Second, "timeout"), target: "/users/1", want: "GET /users/{id}"},
+		{name: "MaxBytesHandler", h: http.MaxBytesHandler(middleware.CaptureRoute(mux), 1<<10), target: "/users/1", want: "GET /users/{id}"},
+		{name: "unmatched", h: withContext(middleware.CaptureRoute(mux)), target: "/nope", want: ""},
+		{name: "panic", cfg: middleware.Cfg{PanicRecover: true}, h: withContext(middleware.CaptureRoute(mux)), target: "/boom", want: "GET /boom"},
+		{name: "groups apply", cfg: middleware.Cfg{RouteGroups: []string{"/users"}}, h: withContext(middleware.CaptureRoute(mux)), target: "/users/1", want: "GET /users"},
+		{name: "StripPrefix records the outer pattern", h: nested(false), target: "/api/users/1", want: "/api/"},
+		{name: "StripPrefix inner capture wins", h: nested(true), target: "/api/users/1", want: "GET /users/{id}"},
+		{name: "StripPrefix outer capture does not override inner", h: middleware.CaptureRoute(nested(true)), target: "/api/users/1", want: "GET /users/{id}"},
+		{name: "StripPrefix inner miss falls back to outer", h: middleware.CaptureRoute(nested(true)), target: "/api/nope", want: "/api/"},
+		{name: "SetRoute beats capture", h: middleware.CaptureRoute(nested(true)), target: "/api/explicit", want: "/api/explicit"},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := serve(t, tc.cfg, tc.h, tc.target); got != tc.want {
+				t.Errorf("route = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("without a Middleware", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		middleware.CaptureRoute(mux).ServeHTTP(rec, httptest.NewRequest("GET", "/users/1", nil))
+		if rec.Code != 200 {
+			t.Errorf("status = %d, want 200", rec.Code)
+		}
+	})
+}
+
 func TestRoute_Groups(t *testing.T) {
 	tcs := []struct {
 		name   string
