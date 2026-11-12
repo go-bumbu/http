@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -510,5 +511,66 @@ func TestGetParsesHTTPDateRetryAfter(t *testing.T) {
 		if w != maxRetryAfterWait {
 			t.Fatalf("HTTP-date Retry-After should clamp to %v, got %v", maxRetryAfterWait, *waits)
 		}
+	}
+}
+
+// A retried error response must leave its keep-alive connection reusable:
+// closing an unread body makes the Transport drop the connection, so a 5xx/429
+// storm would open a new TCP/TLS connection for every attempt.
+func TestGetRetryReusesConnection(t *testing.T) {
+	var hits, conns int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			http.Error(w, "upstream is overloaded, try again later", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			atomic.AddInt32(&conns, 1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	c, _ := newTestClient(t, srv)
+	resp, err := c.Get(context.Background(), srv.URL, nil)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	_ = resp.Body.Close()
+	if n := atomic.LoadInt32(&hits); n != 2 {
+		t.Fatalf("want 2 attempts, got %d", n)
+	}
+	if n := atomic.LoadInt32(&conns); n != 1 {
+		t.Fatalf("the retry opened a new connection: %d connections, want 1", n)
+	}
+}
+
+// A caller-supplied User-Agent replaces the configured one rather than being
+// sent alongside it.
+func TestGetCallerUserAgentOverridesConfigured(t *testing.T) {
+	var gotUA, gotAccept []string
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Values("User-Agent")
+		gotAccept = r.Header.Values("Accept")
+	}))
+	defer srv.Close()
+
+	c, _ := newTestClient(t, srv)
+	resp, err := c.Get(context.Background(), srv.URL, http.Header{
+		"User-Agent": []string{"caller/2.0"},
+		"Accept":     []string{"application/json", "text/plain"},
+	})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	_ = resp.Body.Close()
+	if len(gotUA) != 1 || gotUA[0] != "caller/2.0" {
+		t.Fatalf("User-Agent values = %q, want exactly [caller/2.0]", gotUA)
+	}
+	if len(gotAccept) != 2 {
+		t.Fatalf("multi-valued caller header lost values: Accept = %q", gotAccept)
 	}
 }

@@ -198,7 +198,9 @@ func UserMessage(err error, fallback string) string {
 // them at construction rather than mutating a Client after New.
 type Cfg struct {
 	// Service is the provider's display name, used in error messages.
-	Service   string
+	Service string
+	// UserAgent is the default User-Agent; a User-Agent in Get's header
+	// argument overrides it for that call.
 	UserAgent string
 	// RPS throttles requests to this many per second (burst 1). A value <= 0
 	// leaves the client unthrottled.
@@ -310,6 +312,9 @@ func sleep(ctx context.Context, d time.Duration) error {
 //
 // Cfg.Timeout, when set, bounds the whole call including the body read.
 //
+// Each header name in header replaces the client's default for that name (e.g.
+// Cfg.UserAgent); multiple values under one name are all sent.
+//
 // On success the caller owns resp.Body and must close it.
 func (c *Client) Get(ctx context.Context, url string, header http.Header, allowStatus ...int) (*http.Response, error) {
 	if c.timeout <= 0 {
@@ -386,7 +391,7 @@ func (c *Client) get(ctx context.Context, url string, header http.Header, allowS
 		}
 
 		serr := c.statusError(resp)
-		_ = resp.Body.Close()
+		discardBody(resp.Body)
 		serr.Attempts = attempt
 		if !serr.retryable {
 			return nil, serr
@@ -398,6 +403,20 @@ func (c *Client) get(ctx context.Context, url string, header http.Header, allowS
 		last = &Error{Service: c.service, Kind: KindUnavailable, Attempts: attempts}
 	}
 	return nil, last
+}
+
+// maxDrainBytes bounds how much of a discarded response body is read so its
+// keep-alive connection can be reused; a larger body is not worth reading and
+// the Transport simply closes that connection.
+const maxDrainBytes = 64 << 10
+
+// discardBody drains (up to maxDrainBytes) and closes a response body we will
+// not return. Closing an unread body makes the Transport drop the connection,
+// so every retry during a 5xx/429 storm would otherwise open a new TCP/TLS
+// connection.
+func discardBody(body io.ReadCloser) {
+	_, _ = io.CopyN(io.Discard, body, maxDrainBytes)
+	_ = body.Close()
 }
 
 // withLast attaches the upstream failure of a previous attempt to err, an
@@ -422,6 +441,13 @@ func (c *Client) do(ctx context.Context, url string, header http.Header) (*http.
 	}
 	if c.userAgent != "" {
 		req.Header.Set("User-Agent", c.userAgent)
+	}
+	// Each caller header replaces any default under the same name (so a
+	// per-call User-Agent wins over Cfg.UserAgent instead of being dropped by
+	// the Transport, which sends only the first value) while keeping all of the
+	// caller's own values for that name.
+	for k := range header {
+		req.Header.Del(k)
 	}
 	for k, vals := range header {
 		for _, v := range vals {
