@@ -401,6 +401,13 @@ func TestRoute_InnermostReporterWins(t *testing.T) {
 	depth0 := http.NewServeMux()
 	depth0.Handle("GET /p", setRoute("/explicit"))
 
+	// An inner SetRoute with an empty route is no report: it must not shadow the outer one.
+	emptyInner := setRouteAfter("/api/{v}/", http.StripPrefix("/api", middleware.CaptureRoute(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			middleware.SetRoute(r, "")
+			inner.ServeHTTP(w, r)
+		}))))
+
 	tcs := []struct {
 		name   string
 		h      http.Handler
@@ -414,6 +421,7 @@ func TestRoute_InnermostReporterWins(t *testing.T) {
 		{name: "inner SetRoute beats outer SetRoute before dispatch", h: gorilla, target: "/api/v1/explicit", want: "/explicit"},
 		{name: "inner SetRoute beats outer SetRoute after the handler", h: chi, target: "/api/explicit", want: "/explicit"},
 		{name: "SetRoute at depth 0 beats the pattern", h: depth0, target: "/p", want: "/explicit"},
+		{name: "inner empty SetRoute does not shadow outer SetRoute", h: emptyInner, target: "/api/nope", want: "/api/{v}/"},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {

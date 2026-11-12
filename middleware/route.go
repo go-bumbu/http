@@ -99,16 +99,18 @@ func (m *Middleware) withRouteSlot(r *http.Request) (*http.Request, *routeSlot, 
 // value becomes its own metric series. SetRoute is a no-op on a request that did not pass
 // through a Middleware with metrics enabled.
 func SetRoute(r *http.Request, route string) {
-	if sc := scopeOf(r); sc != nil {
-		s := sc.slot
-		s.mu.Lock()
-		// An outer router's report (gorilla before dispatch, chi after the handler) must not
-		// override one from inside a CaptureRoute; at the same depth the later call wins.
-		if sc.depth >= s.setDepth {
-			s.set, s.setDepth = route, sc.depth
-		}
-		s.mu.Unlock()
+	sc := scopeOf(r)
+	if sc == nil || route == "" {
+		return
 	}
+	s := sc.slot
+	s.mu.Lock()
+	// An outer router's report (gorilla before dispatch, chi after the handler) must not
+	// override one from inside a CaptureRoute; at the same depth the later call wins.
+	if sc.depth >= s.setDepth {
+		s.set, s.setDepth = route, sc.depth
+	}
+	s.mu.Unlock()
 }
 
 // CaptureRoute reports the pattern of the http.ServeMux it wraps, for setups where another
