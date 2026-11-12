@@ -208,8 +208,8 @@ This is the only package that pulls in `golang.org/x/time/rate`; the inbound pac
 ### problemjson
 
 Writes RFC 9457 (`application/problem+json`) error responses — one consistent,
-spec-shaped error body (a stable `type` URI, `title`/`detail`, and the request path
-as `instance`) in place of ad-hoc `{"error":...}` shapes. `ModeMasked` strips
+spec-shaped error body (a stable `type` URI, `title`/`detail`, and the escaped
+request path as `instance`) in place of ad-hoc `{"error":...}` shapes. `ModeMasked` strips
 handler-supplied detail in production while keeping a correlation `reference`; set
 `OnProblem` to log the unmasked details (same `reference`) so the real cause is not lost.
 

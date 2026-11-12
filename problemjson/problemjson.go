@@ -4,7 +4,7 @@
 // It replaces ad-hoc {"error":..., "code":...} error shapes with one
 // consistent, spec-shaped error body: a stable, dereferenceable-looking but
 // never-fetched Type URI in place of a loose code string, a human title/detail,
-// and the request path as instance.
+// and the escaped request path as instance.
 //
 // Construct a Writer with New, giving it the base URI that namespaces every
 // problem's Type and, optionally, titles for your own slugs (merged over the
@@ -197,8 +197,9 @@ func New(cfg Cfg) (*Writer, error) {
 
 // Write emits an application/problem+json response. Type is built from slug
 // (BaseURI + "/" + slug) and Title is derived from slug via TitleFor; Instance
-// is always the request path, so a client can tell which call failed without
-// re-reading its own request.
+// is always the escaped request path (r.URL.EscapedPath(), never the query), so
+// a client can tell which call failed without re-reading its own request and
+// the value stays a valid URI reference as RFC 9457 requires.
 // Under ModeMasked the type and title are replaced with the generic
 // SlugMasked identity and detail is omitted; a non-empty reference is
 // included in both modes, and Cfg.OnProblem receives the unmasked Details.
@@ -299,7 +300,7 @@ func (wr *Writer) details(r *http.Request, status int, slug, detail string) Deta
 		Title:     wr.TitleFor(slug),
 		Status:    status,
 		Detail:    detail,
-		Instance:  r.URL.Path,
+		Instance:  r.URL.EscapedPath(),
 		Reference: wr.reference(r),
 	}
 }

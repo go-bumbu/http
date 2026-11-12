@@ -78,6 +78,48 @@ func TestWrite(t *testing.T) {
 	}
 }
 
+// TestInstanceKeepsEscapedPath pins instance to the escaped request path: RFC
+// 9457 §3.1.5 requires a URI reference, so "/files/a b" (decoded) is invalid
+// and "/a%2Fb" must not collapse to "/a/b". Both modes and the Details handed
+// to OnProblem carry the same value.
+func TestInstanceKeepsEscapedPath(t *testing.T) {
+	tcs := []struct {
+		name, target, want string
+	}{
+		{name: "escaped space", target: "/files/a%20b", want: "/files/a%20b"},
+		{name: "escaped slash", target: "/a%2Fb", want: "/a%2Fb"},
+		{name: "plain path", target: "/api/v0/x", want: "/api/v0/x"},
+	}
+	modes := []struct {
+		name string
+		mode Mode
+	}{{"dev", ModeDev}, {"masked", ModeMasked}}
+	for _, m := range modes {
+		for _, tc := range tcs {
+			t.Run(m.name+"/"+tc.name, func(t *testing.T) {
+				var notified Details
+				wr, err := New(Cfg{BaseURI: testBaseURI, Mode: m.mode, OnProblem: func(_ *http.Request, d Details) { notified = d }})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				w := httptest.NewRecorder()
+				wr.Write(w, httptest.NewRequest(http.MethodGet, tc.target, nil), http.StatusNotFound, SlugNotFound, "gone")
+
+				var got Details
+				if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+					t.Fatalf("decode body: %v; body=%s", err, w.Body.String())
+				}
+				if got.Instance != tc.want {
+					t.Errorf("body instance = %q, want %q", got.Instance, tc.want)
+				}
+				if notified.Instance != tc.want {
+					t.Errorf("OnProblem instance = %q, want %q", notified.Instance, tc.want)
+				}
+			})
+		}
+	}
+}
+
 func TestWriteValidation(t *testing.T) {
 	wr := newTestWriter(t)
 	req := httptest.NewRequest(http.MethodPost, "/api/v0/x", nil)
