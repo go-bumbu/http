@@ -80,16 +80,23 @@ func TestRoute_OuterSeesPattern(t *testing.T) {
 	tcs := []struct {
 		name   string
 		cfg    middleware.Cfg
+		h      http.Handler // defaults to mux
 		target string
 		want   string
 	}{
 		{name: "metrics off", cfg: middleware.Cfg{}, target: "/u/1", want: "GET /u/{id}"},
 		{name: "metrics on", cfg: middleware.Cfg{Metrics: &routeSpy{}}, target: "/u/1", want: "GET /u/{id}"},
 		{name: "abort panic", cfg: middleware.Cfg{Metrics: &routeSpy{}, PanicRecover: true}, target: "/abort", want: "GET /abort"},
+		{name: "CaptureRoute directly under Wrap", cfg: middleware.Cfg{Metrics: &routeSpy{}}, h: middleware.CaptureRoute(mux), target: "/u/1", want: "GET /u/{id}"},
+		{name: "CaptureRoute abort panic", cfg: middleware.Cfg{Metrics: &routeSpy{}, PanicRecover: true}, h: middleware.CaptureRoute(mux), target: "/abort", want: "GET /abort"},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			h := middleware.New(tc.cfg).Wrap(mux)
+			next := tc.h
+			if next == nil {
+				next = mux
+			}
+			h := middleware.New(tc.cfg).Wrap(next)
 			r := httptest.NewRequest("GET", tc.target, nil)
 			func() {
 				defer func() { _ = recover() }() // the abort case re-panics by design
