@@ -185,10 +185,15 @@ timeouts), `Retry-After` compliance, and a typed `*Error` carrying both the tech
 detail (for logs) and a human-readable sentence naming the service (for the UI).
 
 ```go
-client := outbound.New(outbound.Cfg{Service: "Cover Art Archive", RPS: 5})
+client := outbound.New(outbound.Cfg{Service: "Cover Art Archive", RPS: 5, Timeout: 8 * time.Second})
 resp, err := client.Get(ctx, url, nil)
 // on failure: outbound.HTTPStatus(err) and outbound.UserMessage(err, fallback)
 ```
+
+The `Client`'s timeout (20s by default) bounds each attempt; set `Timeout` to cap the
+whole call — attempts, backoff, and the body read — for user-facing requests. If the
+context or budget ends after an upstream failure, the error still carries that
+`*Error` (and `errors.Is` matches the context error).
 
 This is the only package that pulls in `golang.org/x/time/rate`; the inbound packages above do not.
 

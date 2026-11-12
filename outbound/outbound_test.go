@@ -3,6 +3,7 @@ package outbound
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -389,6 +390,103 @@ func TestGetKeepsUpstreamErrorWhenContextEndsDuringBackoff(t *testing.T) {
 				t.Fatalf("want 1 attempt before the backoff was cut short, got %d", n)
 			}
 		})
+	}
+}
+
+// Cfg.Timeout caps the whole call. Without it, an upstream that hangs on every
+// attempt costs MaxAttempts per-attempt timeouts plus the backoff; with it, the
+// call ends at the budget and reads as an upstream timeout.
+func TestGetTimeoutCapsWholeCall(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		select { // hang until the client gives up
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	c := New(Cfg{
+		Service: "Example Service",
+		Client:  srv.Client(), // no per-attempt timeout: only the budget can end the call
+		Backoff: 10 * time.Millisecond,
+		Timeout: 100 * time.Millisecond,
+	})
+	start := time.Now()
+	_, err := c.Get(context.Background(), srv.URL, nil)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Get took %v, want it capped near the 100ms budget", elapsed)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("errors.Is(err, DeadlineExceeded) = false; err = %v", err)
+	}
+	var uerr *Error
+	if !errors.As(err, &uerr) || uerr.Kind != KindTimeout {
+		t.Fatalf("want a KindTimeout *outbound.Error, got %T: %v", err, err)
+	}
+	if got := HTTPStatus(err); got != http.StatusGatewayTimeout {
+		t.Fatalf("HTTPStatus = %d, want 504", got)
+	}
+	if n := atomic.LoadInt32(&hits); n != 1 {
+		t.Fatalf("want 1 attempt within the budget, got %d", n)
+	}
+}
+
+// A budget that runs out during the backoff after a 503 ends the call there,
+// keeping the upstream failure rather than replacing it with a timeout.
+func TestGetTimeoutDuringBackoffKeepsUpstreamError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	c := New(Cfg{
+		Service: "Example Service",
+		Client:  srv.Client(),
+		Backoff: 5 * time.Second, // far beyond the budget
+		Timeout: 50 * time.Millisecond,
+	})
+	start := time.Now()
+	_, err := c.Get(context.Background(), srv.URL, nil)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Get took %v, want the backoff cut short by the 50ms budget", elapsed)
+	}
+	var uerr *Error
+	if !errors.As(err, &uerr) || uerr.Status != http.StatusServiceUnavailable || uerr.Kind != KindUnavailable {
+		t.Fatalf("want the upstream 503 *outbound.Error, got %T: %v", err, err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("errors.Is(err, DeadlineExceeded) = false; err = %v", err)
+	}
+}
+
+// The budget also covers reading the body (like http.Client.Timeout), so it
+// must stay alive after Get returns: the response is readable in full, and
+// the budget is released when the caller closes the body.
+func TestGetTimeoutLeavesBodyReadable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()          // Get returns on the headers...
+		time.Sleep(20 * time.Millisecond) // ...before the body arrives
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	c := New(Cfg{Service: "Example Service", Client: srv.Client(), Timeout: time.Second})
+	resp, err := c.Get(context.Background(), srv.URL, nil)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading the body after Get returned: %v", err)
+	}
+	if string(body) != `{"ok":true}` {
+		t.Fatalf("body = %q", body)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }
 

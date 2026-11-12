@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -203,8 +204,19 @@ type Cfg struct {
 	// leaves the client unthrottled.
 	RPS float64
 
-	// Client overrides the default *http.Client (20s timeout).
+	// Client overrides the default *http.Client (20s timeout). Its timeout
+	// bounds each attempt, not the whole call; see Timeout.
 	Client *http.Client
+	// Timeout is an overall budget for one Get call: every attempt, the
+	// backoff and Retry-After waits between them, and reading the response
+	// body (like http.Client.Timeout, it stays armed until the caller closes
+	// the body). When it runs out, Get stops retrying: if an attempt already
+	// failed upstream, that *Error is returned (see Get); otherwise the call
+	// fails as a KindTimeout *Error. Either way errors.Is(err,
+	// context.DeadlineExceeded) holds. Zero (or negative) adds no budget, so a
+	// call is bounded only by ctx and MaxAttempts × the per-attempt timeout
+	// plus backoff — about a minute with the defaults.
+	Timeout time.Duration
 	// Limiter overrides the limiter built from RPS.
 	Limiter *rate.Limiter
 	// MaxAttempts bounds the total number of requests per call (1 = no retry);
@@ -232,6 +244,7 @@ type Client struct {
 	maxAttempts   int
 	backoff       time.Duration
 	retryAfterCap time.Duration
+	timeout       time.Duration
 	wait          func(ctx context.Context, d time.Duration) error
 }
 
@@ -246,6 +259,7 @@ func New(cfg Cfg) *Client {
 		maxAttempts:   cfg.MaxAttempts,
 		backoff:       cfg.Backoff,
 		retryAfterCap: cfg.RetryAfterCap,
+		timeout:       cfg.Timeout,
 		wait:          cfg.Wait,
 	}
 	if c.client == nil {
@@ -294,8 +308,47 @@ func sleep(ctx context.Context, d time.Duration) error {
 // context error. Before any upstream failure, the context error is returned
 // as-is.
 //
+// Cfg.Timeout, when set, bounds the whole call including the body read.
+//
 // On success the caller owns resp.Body and must close it.
 func (c *Client) Get(ctx context.Context, url string, header http.Header, allowStatus ...int) (*http.Response, error) {
+	if c.timeout <= 0 {
+		return c.get(ctx, url, header, allowStatus)
+	}
+	bctx, cancel := context.WithTimeout(ctx, c.timeout)
+	resp, err := c.get(bctx, url, header, allowStatus)
+	if err != nil {
+		budgetSpent := ctx.Err() == nil && bctx.Err() != nil
+		cancel()
+		var uerr *Error
+		if budgetSpent && !errors.As(err, &uerr) {
+			// Our own budget ran out before any upstream failure: that is the
+			// provider being too slow, not the caller giving up.
+			return nil, &Error{Service: c.service, Kind: KindTimeout, Err: err, Attempts: 1}
+		}
+		return nil, err
+	}
+	// The budget covers the body read, so release it only when the caller
+	// closes the body.
+	resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
+}
+
+// cancelOnClose releases a Get's time budget when the response body is closed.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnClose) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
+}
+
+// get is the retry loop behind Get, running under ctx (already carrying the
+// Cfg.Timeout budget when one is set).
+func (c *Client) get(ctx context.Context, url string, header http.Header, allowStatus []int) (*http.Response, error) {
 	attempts := c.maxAttempts
 	backoff := c.backoff
 	var last *Error
