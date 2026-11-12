@@ -211,15 +211,18 @@ Writes RFC 9457 (`application/problem+json`) error responses — one consistent,
 spec-shaped error body (a stable `type` URI, `title`/`detail`, and the escaped
 request path as `instance`) in place of ad-hoc `{"error":...}` shapes. `ModeMasked` strips
 handler-supplied detail in production while keeping a correlation `reference`; set
-`OnProblem` to log the unmasked details (same `reference`) so the real cause is not lost.
+`OnProblem` to log the unmasked problem (same `reference`) so the real cause is not lost:
+it receives the `Details` plus the validation field errors, the upstream reason, and the
+upstream error, all of which a masked body omits.
 
 ```go
 pj, err := problemjson.New(problemjson.Cfg{
 	BaseURI:   "https://errors.example.com",
 	Mode:      problemjson.ModeMasked,
 	RequestID: requestIDFrom, // func(*http.Request) string
-	OnProblem: func(r *http.Request, d problemjson.Details) {
-		slog.Error("problem", "status", d.Status, "detail", d.Detail, "reference", d.Reference)
+	OnProblem: func(r *http.Request, p problemjson.Problem) {
+		slog.Error("problem", "status", p.Status, "detail", p.Detail, "reference", p.Reference,
+			"fields", p.Errors, "reason", p.Reason, "err", p.Err)
 	},
 })
 // handle err
@@ -229,5 +232,6 @@ pj.WriteUpstream(w, r, err, "The catalog is unavailable.") // maps an outbound.*
 
 In dev mode, `WriteUpstream` adds an extra `reason` field naming the exact failure
 (e.g. `unreachable`) whenever the error can supply one through an optional
-`UpstreamReason() string` method (`outbound.*Error` does). `ModeMasked` strips it, and
+`UpstreamReason() string` method (`outbound.*Error` does). `ModeMasked` strips it from the
+body (`OnProblem` still gets it in `Problem.Reason`), and
 neither package imports the other — the reason travels through the method name alone.

@@ -36,7 +36,7 @@ const (
 	// type/title with a generic identity (SlugMasked), leaving only the HTTP
 	// status, the request instance, and the correlation reference. Use it in
 	// production so internal specifics never reach the client; set
-	// Cfg.OnProblem to log the unmasked Details the reference points at.
+	// Cfg.OnProblem to log the unmasked Problem the reference points at.
 	ModeMasked
 )
 
@@ -88,7 +88,7 @@ type Details struct {
 	Instance string `json:"instance,omitempty"`
 	// Reference is a caller-supplied correlation id (RFC 9457 extension member,
 	// from Cfg.RequestID), emitted in both modes when non-empty so a masked
-	// response can be matched to the unmasked Details passed to Cfg.OnProblem
+	// response can be matched to the unmasked Problem passed to Cfg.OnProblem
 	// (which the caller logs).
 	Reference string `json:"reference,omitempty"`
 }
@@ -111,6 +111,21 @@ type ValidationDetails struct {
 	Errors []FieldError `json:"errors,omitempty"`
 }
 
+// Problem is everything a write knows about a problem, unmasked, as handed to
+// Cfg.OnProblem for logging: the Details plus what the body may omit — the
+// validation field errors (WriteValidation), and the upstream reason and error
+// (WriteUpstream). Fields a write path does not produce are left zero.
+type Problem struct {
+	Details
+	// Errors are WriteValidation's field errors; nil on other paths.
+	Errors []FieldError
+	// Reason is the upstream error's UpstreamReason() token, in every mode
+	// (the body's "reason" member is dev-only); "" when the error names none.
+	Reason string
+	// Err is the error passed to WriteUpstream; nil on other paths.
+	Err error
+}
+
 // upstreamDetails extends Details with the specific upstream reason. WriteUpstream
 // emits it only in dev mode when the error can name its reason; otherwise (reason
 // unknown, or ModeMasked) the plain Details is written and the field is absent.
@@ -130,7 +145,8 @@ type UpstreamError interface {
 
 // upstreamReasoner is an optional companion to UpstreamError: a failed call that
 // can name its specific reason with a short, stable token (e.g. "unreachable").
-// WriteUpstream surfaces it only in dev mode. Like UpstreamError it is matched
+// WriteUpstream puts it in the body only in dev mode, and in Problem.Reason for
+// Cfg.OnProblem in both modes. Like UpstreamError it is matched
 // structurally, so this package still imports nothing from the client that
 // produced the error.
 type upstreamReasoner interface {
@@ -156,12 +172,13 @@ type Cfg struct {
 	// rendering for every response this Writer emits.
 	Mode Mode
 	// OnProblem, when set, is called once per response, in every mode and from
-	// every Write method, with the full unmasked Details (including Reference)
-	// before any masking and before the body is written. It is the hook that
-	// keeps a ModeMasked response traceable: log the Details here and the
-	// reference the client sees points at the real detail. Validation field
-	// errors and the upstream reason are not included. Nil means no hook.
-	OnProblem func(r *http.Request, d Details)
+	// every Write method, with the full unmasked Problem — the Details
+	// (including Reference) plus validation field errors, upstream reason, and
+	// upstream error — before any masking and before the body is written. It is
+	// the hook that keeps a ModeMasked response traceable: log the Problem here
+	// and the reference the client sees points at the real detail. Nil means no
+	// hook.
+	OnProblem func(r *http.Request, p Problem)
 }
 
 // Writer emits problem+json responses for one base URI and title set.
@@ -170,7 +187,7 @@ type Writer struct {
 	titles    map[string]string
 	requestID func(*http.Request) string
 	mode      Mode
-	onProblem func(*http.Request, Details)
+	onProblem func(*http.Request, Problem)
 }
 
 // New returns a Writer configured by cfg. It errors when BaseURI is empty: the
@@ -202,34 +219,24 @@ func New(cfg Cfg) (*Writer, error) {
 // the value stays a valid URI reference as RFC 9457 requires.
 // Under ModeMasked the type and title are replaced with the generic
 // SlugMasked identity and detail is omitted; a non-empty reference is
-// included in both modes, and Cfg.OnProblem receives the unmasked Details.
+// included in both modes, and Cfg.OnProblem receives the unmasked Problem.
 //
 // A problem is always an error: a status outside 400-599 (0, a 2xx/3xx, or an
 // out-of-range code) is written as 500, and the body's status and the Details
 // passed to Cfg.OnProblem carry that normalised value.
 func (wr *Writer) Write(w http.ResponseWriter, r *http.Request, status int, slug, detail string) {
 	status = errorStatus(status, http.StatusInternalServerError)
-	d := wr.details(r, status, slug, detail)
-	wr.notify(r, d)
-	if wr.mode == ModeMasked {
-		d = wr.mask(d)
-	}
-	writeProblem(w, status, d)
+	wr.emit(w, r, Problem{Details: wr.details(r, status, slug, detail)})
 }
 
 // WriteValidation reports a well-formed but invalid request: always 422,
 // optionally itemising which fields failed and why.
 // Under ModeMasked the field errors are dropped and the body collapses
-// to the generic SlugMasked identity (still 422).
+// to the generic SlugMasked identity (still 422); Cfg.OnProblem still
+// receives them in Problem.Errors.
 func (wr *Writer) WriteValidation(w http.ResponseWriter, r *http.Request, detail string, fields ...FieldError) {
-	const status = http.StatusUnprocessableEntity
-	d := wr.details(r, status, SlugValidationError, detail)
-	wr.notify(r, d)
-	if wr.mode == ModeMasked {
-		writeProblem(w, status, wr.mask(d))
-		return
-	}
-	writeProblem(w, status, ValidationDetails{Details: d, Errors: fields})
+	d := wr.details(r, http.StatusUnprocessableEntity, SlugValidationError, detail)
+	wr.emit(w, r, Problem{Details: d, Errors: fields})
 }
 
 // WriteUpstream reports a failed call to an external service: 429 when the
@@ -244,7 +251,8 @@ func (wr *Writer) WriteValidation(w http.ResponseWriter, r *http.Request, detail
 // member so a developer sees the exact cause behind the coarse status. Under
 // ModeMasked the type, title, detail, and reason are all stripped as for Write —
 // only the status, instance, and reference remain — so the internal reason never
-// reaches a production client.
+// reaches a production client. Cfg.OnProblem receives the reason and err in
+// both modes, for logging.
 func (wr *Writer) WriteUpstream(w http.ResponseWriter, r *http.Request, err error, fallback string) {
 	status, detail := http.StatusBadGateway, fallback
 	var ue UpstreamError
@@ -260,18 +268,12 @@ func (wr *Writer) WriteUpstream(w http.ResponseWriter, r *http.Request, err erro
 		slug = SlugUpstreamTimeout
 	}
 
-	if wr.mode != ModeMasked {
-		var ur upstreamReasoner
-		if errors.As(err, &ur) {
-			if reason := ur.UpstreamReason(); reason != "" {
-				d := wr.details(r, status, slug, detail)
-				wr.notify(r, d)
-				writeProblem(w, status, upstreamDetails{Details: d, Reason: reason})
-				return
-			}
-		}
+	p := Problem{Details: wr.details(r, status, slug, detail), Err: err}
+	var ur upstreamReasoner
+	if errors.As(err, &ur) {
+		p.Reason = ur.UpstreamReason()
 	}
-	wr.Write(w, r, status, slug, detail)
+	wr.emit(w, r, p)
 }
 
 // TypeURI builds the stable Type URI (BaseURI + "/" + slug) a problem carries.
@@ -318,10 +320,23 @@ func (wr *Writer) mask(d Details) Details {
 	}
 }
 
-// notify hands the unmasked d to the OnProblem hook, if one is configured.
-func (wr *Writer) notify(r *http.Request, d Details) {
+// emit is the single exit of every Write method: it hands the unmasked p to the
+// OnProblem hook (if configured) exactly once, then writes the body — masked
+// under ModeMasked, otherwise the Details plus whichever of the field errors or
+// reason p carries.
+func (wr *Writer) emit(w http.ResponseWriter, r *http.Request, p Problem) {
 	if wr.onProblem != nil {
-		wr.onProblem(r, d)
+		wr.onProblem(r, p)
+	}
+	switch {
+	case wr.mode == ModeMasked:
+		writeProblem(w, p.Status, wr.mask(p.Details))
+	case p.Reason != "":
+		writeProblem(w, p.Status, upstreamDetails{Details: p.Details, Reason: p.Reason})
+	case len(p.Errors) > 0:
+		writeProblem(w, p.Status, ValidationDetails{Details: p.Details, Errors: p.Errors})
+	default:
+		writeProblem(w, p.Status, p.Details)
 	}
 }
 

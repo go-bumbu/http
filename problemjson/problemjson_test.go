@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 )
 
@@ -98,7 +99,7 @@ func TestInstanceKeepsEscapedPath(t *testing.T) {
 		for _, tc := range tcs {
 			t.Run(m.name+"/"+tc.name, func(t *testing.T) {
 				var notified Details
-				wr, err := New(Cfg{BaseURI: testBaseURI, Mode: m.mode, OnProblem: func(_ *http.Request, d Details) { notified = d }})
+				wr, err := New(Cfg{BaseURI: testBaseURI, Mode: m.mode, OnProblem: func(_ *http.Request, p Problem) { notified = p.Details }})
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}
@@ -618,7 +619,7 @@ func TestOnProblemReceivesUnmaskedDetails(t *testing.T) {
 		BaseURI:   testBaseURI,
 		Mode:      ModeMasked,
 		RequestID: func(r *http.Request) string { return "ref-" + r.URL.Path },
-		OnProblem: func(r *http.Request, d Details) { calls = append(calls, call{r.URL.Path, d}) },
+		OnProblem: func(r *http.Request, p Problem) { calls = append(calls, call{r.URL.Path, p.Details}) },
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -698,7 +699,7 @@ func TestOnProblemReceivesUnmaskedDetails(t *testing.T) {
 // exactly once even on WriteUpstream's reason path.
 func TestOnProblemDevModeCalledOnce(t *testing.T) {
 	n := 0
-	wr, err := New(Cfg{BaseURI: testBaseURI, OnProblem: func(*http.Request, Details) { n++ }})
+	wr, err := New(Cfg{BaseURI: testBaseURI, OnProblem: func(*http.Request, Problem) { n++ }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -713,13 +714,75 @@ func TestOnProblemDevModeCalledOnce(t *testing.T) {
 	}
 }
 
+// TestOnProblemMaskedKeepsFieldErrorsAndReason pins that a masked 422/502 stays
+// diagnosable: the hook receives the validation field errors, and the upstream
+// reason and error, even though ModeMasked strips them all from the body.
+func TestOnProblemMaskedKeepsFieldErrorsAndReason(t *testing.T) {
+	var got []Problem
+	wr, err := New(Cfg{BaseURI: testBaseURI, Mode: ModeMasked, OnProblem: func(_ *http.Request, p Problem) { got = append(got, p) }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Run("WriteValidation", func(t *testing.T) {
+		got = nil
+		fields := []FieldError{{Pointer: "/items", Detail: "max 10"}, {Pointer: "/name", Detail: "required"}}
+		w := httptest.NewRecorder()
+		wr.WriteValidation(w, httptest.NewRequest(http.MethodPost, "/x", nil), "bad input", fields...)
+
+		var body map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, w.Body.String())
+		}
+		if _, ok := body["errors"]; ok {
+			t.Fatalf("masked body must not include field errors, body=%s", w.Body.String())
+		}
+		if len(got) != 1 {
+			t.Fatalf("OnProblem called %d times, want 1", len(got))
+		}
+		if !reflect.DeepEqual(got[0].Errors, fields) {
+			t.Fatalf("OnProblem Errors = %+v, want %+v", got[0].Errors, fields)
+		}
+		if got[0].Reason != "" || got[0].Err != nil {
+			t.Fatalf("validation problem must carry no reason/err, got %+v", got[0])
+		}
+	})
+
+	t.Run("WriteUpstream", func(t *testing.T) {
+		got = nil
+		upErr := stubUpstreamReason{stubUpstream: stubUpstream{status: http.StatusBadGateway, msg: "down"}, reason: "unreachable"}
+		w := httptest.NewRecorder()
+		wr.WriteUpstream(w, httptest.NewRequest(http.MethodGet, "/x", nil), upErr, "fallback")
+
+		var body map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, w.Body.String())
+		}
+		if _, ok := body["reason"]; ok {
+			t.Fatalf("masked body must not include reason, body=%s", w.Body.String())
+		}
+		if len(got) != 1 {
+			t.Fatalf("OnProblem called %d times, want 1", len(got))
+		}
+		if got[0].Reason != "unreachable" {
+			t.Fatalf("OnProblem Reason = %q, want %q", got[0].Reason, "unreachable")
+		}
+		if got[0].Err != upErr {
+			t.Fatalf("OnProblem Err = %v, want the upstream error %v", got[0].Err, upErr)
+		}
+		if got[0].Errors != nil {
+			t.Fatalf("upstream problem must carry no field errors, got %+v", got[0].Errors)
+		}
+	})
+}
+
 // TestStatusNormalised pins that a status outside 400-599 never reaches the
 // client: Write maps it to 500 and WriteUpstream to 502 (no WriteHeader panic
 // on 0, no problem body behind a success status), and the body's status and
 // the OnProblem hook both see the normalised value.
 func TestStatusNormalised(t *testing.T) {
 	var hookStatus int
-	wr, err := New(Cfg{BaseURI: testBaseURI, OnProblem: func(_ *http.Request, d Details) { hookStatus = d.Status }})
+	wr, err := New(Cfg{BaseURI: testBaseURI, OnProblem: func(_ *http.Request, p Problem) { hookStatus = p.Status }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -795,7 +858,7 @@ func TestBodyPinnedPerPath(t *testing.T) {
 		write    func(wr *Writer, w http.ResponseWriter, r *http.Request)
 		wantCode int
 		wantBody string
-		wantHook Details
+		wantHook Problem
 	}{
 		{
 			name: "Write dev", mode: ModeDev,
@@ -804,7 +867,7 @@ func TestBodyPinnedPerPath(t *testing.T) {
 			},
 			wantCode: http.StatusConflict,
 			wantBody: `{"type":"https://example.test/probs/conflict","title":"Conflict","status":409,"detail":"already exists","instance":"/api/v0/p","reference":"ref-1"}`,
-			wantHook: Details{Type: testBaseURI + "/conflict", Title: "Conflict", Status: 409, Detail: "already exists", Instance: path, Reference: ref},
+			wantHook: Problem{Details: Details{Type: testBaseURI + "/conflict", Title: "Conflict", Status: 409, Detail: "already exists", Instance: path, Reference: ref}},
 		},
 		{
 			name: "Write masked", mode: ModeMasked,
@@ -813,7 +876,7 @@ func TestBodyPinnedPerPath(t *testing.T) {
 			},
 			wantCode: http.StatusConflict,
 			wantBody: `{"type":"https://example.test/probs/error","title":"An error occurred","status":409,"instance":"/api/v0/p","reference":"ref-1"}`,
-			wantHook: Details{Type: testBaseURI + "/conflict", Title: "Conflict", Status: 409, Detail: "already exists", Instance: path, Reference: ref},
+			wantHook: Problem{Details: Details{Type: testBaseURI + "/conflict", Title: "Conflict", Status: 409, Detail: "already exists", Instance: path, Reference: ref}},
 		},
 		{
 			name: "WriteValidation dev", mode: ModeDev,
@@ -822,7 +885,7 @@ func TestBodyPinnedPerPath(t *testing.T) {
 			},
 			wantCode: http.StatusUnprocessableEntity,
 			wantBody: `{"type":"https://example.test/probs/validation_error","title":"Validation error","status":422,"detail":"bad input","instance":"/api/v0/p","reference":"ref-1","errors":[{"pointer":"/qty","detail":"too big"}]}`,
-			wantHook: Details{Type: testBaseURI + "/validation_error", Title: "Validation error", Status: 422, Detail: "bad input", Instance: path, Reference: ref},
+			wantHook: Problem{Details: Details{Type: testBaseURI + "/validation_error", Title: "Validation error", Status: 422, Detail: "bad input", Instance: path, Reference: ref}, Errors: []FieldError{{Pointer: "/qty", Detail: "too big"}}},
 		},
 		{
 			name: "WriteValidation masked", mode: ModeMasked,
@@ -831,7 +894,7 @@ func TestBodyPinnedPerPath(t *testing.T) {
 			},
 			wantCode: http.StatusUnprocessableEntity,
 			wantBody: `{"type":"https://example.test/probs/error","title":"An error occurred","status":422,"instance":"/api/v0/p","reference":"ref-1"}`,
-			wantHook: Details{Type: testBaseURI + "/validation_error", Title: "Validation error", Status: 422, Detail: "bad input", Instance: path, Reference: ref},
+			wantHook: Problem{Details: Details{Type: testBaseURI + "/validation_error", Title: "Validation error", Status: 422, Detail: "bad input", Instance: path, Reference: ref}, Errors: []FieldError{{Pointer: "/qty", Detail: "too big"}}},
 		},
 		{
 			name: "WriteUpstream reason dev", mode: ModeDev,
@@ -840,7 +903,7 @@ func TestBodyPinnedPerPath(t *testing.T) {
 			},
 			wantCode: http.StatusGatewayTimeout,
 			wantBody: `{"type":"https://example.test/probs/upstream_timeout","title":"Upstream timeout","status":504,"detail":"provider slow","instance":"/api/v0/p","reference":"ref-1","reason":"timeout"}`,
-			wantHook: Details{Type: testBaseURI + "/upstream_timeout", Title: "Upstream timeout", Status: 504, Detail: "provider slow", Instance: path, Reference: ref},
+			wantHook: Problem{Details: Details{Type: testBaseURI + "/upstream_timeout", Title: "Upstream timeout", Status: 504, Detail: "provider slow", Instance: path, Reference: ref}, Reason: "timeout", Err: stubUpstreamReason{stubUpstream: stubUpstream{status: http.StatusGatewayTimeout, msg: "provider slow"}, reason: "timeout"}},
 		},
 		{
 			name: "WriteUpstream reason masked", mode: ModeMasked,
@@ -849,7 +912,7 @@ func TestBodyPinnedPerPath(t *testing.T) {
 			},
 			wantCode: http.StatusGatewayTimeout,
 			wantBody: `{"type":"https://example.test/probs/error","title":"An error occurred","status":504,"instance":"/api/v0/p","reference":"ref-1"}`,
-			wantHook: Details{Type: testBaseURI + "/upstream_timeout", Title: "Upstream timeout", Status: 504, Detail: "provider slow", Instance: path, Reference: ref},
+			wantHook: Problem{Details: Details{Type: testBaseURI + "/upstream_timeout", Title: "Upstream timeout", Status: 504, Detail: "provider slow", Instance: path, Reference: ref}, Reason: "timeout", Err: stubUpstreamReason{stubUpstream: stubUpstream{status: http.StatusGatewayTimeout, msg: "provider slow"}, reason: "timeout"}},
 		},
 		{
 			name: "WriteUpstream no reason dev", mode: ModeDev,
@@ -858,7 +921,7 @@ func TestBodyPinnedPerPath(t *testing.T) {
 			},
 			wantCode: http.StatusTooManyRequests,
 			wantBody: `{"type":"https://example.test/probs/upstream_rate_limited","title":"Upstream rate limited","status":429,"detail":"slow down","instance":"/api/v0/p","reference":"ref-1"}`,
-			wantHook: Details{Type: testBaseURI + "/upstream_rate_limited", Title: "Upstream rate limited", Status: 429, Detail: "slow down", Instance: path, Reference: ref},
+			wantHook: Problem{Details: Details{Type: testBaseURI + "/upstream_rate_limited", Title: "Upstream rate limited", Status: 429, Detail: "slow down", Instance: path, Reference: ref}, Err: stubUpstream{status: http.StatusTooManyRequests, msg: "slow down"}},
 		},
 		{
 			name: "WriteUpstream fallback masked", mode: ModeMasked,
@@ -867,17 +930,17 @@ func TestBodyPinnedPerPath(t *testing.T) {
 			},
 			wantCode: http.StatusBadGateway,
 			wantBody: `{"type":"https://example.test/probs/error","title":"An error occurred","status":502,"instance":"/api/v0/p","reference":"ref-1"}`,
-			wantHook: Details{Type: testBaseURI + "/upstream_error", Title: "Upstream error", Status: 502, Detail: "fallback", Instance: path, Reference: ref},
+			wantHook: Problem{Details: Details{Type: testBaseURI + "/upstream_error", Title: "Upstream error", Status: 502, Detail: "fallback", Instance: path, Reference: ref}, Err: errNotUpstream},
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var hook []Details
+			var hook []Problem
 			wr, err := New(Cfg{
 				BaseURI:   testBaseURI,
 				Mode:      tc.mode,
 				RequestID: func(*http.Request) string { return ref },
-				OnProblem: func(_ *http.Request, d Details) { hook = append(hook, d) },
+				OnProblem: func(_ *http.Request, p Problem) { hook = append(hook, p) },
 			})
 			if err != nil {
 				t.Fatalf("New: %v", err)
@@ -894,7 +957,7 @@ func TestBodyPinnedPerPath(t *testing.T) {
 			if got := w.Body.String(); got != tc.wantBody+"\n" {
 				t.Fatalf("body =\n%s\nwant\n%s", got, tc.wantBody)
 			}
-			if len(hook) != 1 || hook[0] != tc.wantHook {
+			if len(hook) != 1 || !reflect.DeepEqual(hook[0], tc.wantHook) {
 				t.Fatalf("OnProblem got %+v, want exactly [%+v]", hook, tc.wantHook)
 			}
 		})
