@@ -420,3 +420,52 @@ func TestHandlerServeIndexEdgeCases(t *testing.T) {
 		}
 	})
 }
+
+// An unclean request path (an empty segment from "//", or a "." segment) is not
+// a valid fs path: os.DirFS answers fs.Stat with fs.ErrInvalid, which once
+// surfaced as a client-triggerable 500. It must be a 404 on every FS.
+func TestHandlerUncleanPathIsNotFound(t *testing.T) {
+	dir := t.TempDir()
+	for name, data := range map[string]string{"index.html": "test index", "app.js": "app js"} {
+		if err := os.WriteFile(dir+"/"+name, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fileSystems := map[string]fs.FS{
+		"dirFS": os.DirFS(dir),
+		"mapFS": fstest.MapFS{"index.html": {Data: []byte("test index")}, "app.js": {Data: []byte("app js")}},
+	}
+	for fsName, fsys := range fileSystems {
+		h, err := New(Cfg{FS: fsys, PathPrefix: "/ui"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cases := []struct {
+			path string
+			want int
+			body string
+		}{
+			{path: "/ui//app.js", want: http.StatusNotFound},
+			{path: "/ui/a//b", want: http.StatusNotFound},
+			{path: "/ui/./app.js", want: http.StatusNotFound},
+			{path: "/ui/a/./b", want: http.StatusNotFound},
+			{path: "/ui/app.js", want: http.StatusOK, body: "app js"},
+			{path: "/ui/a/b", want: http.StatusOK, body: "test index"},
+			{path: "/ui/a//", want: http.StatusOK, body: "test index"}, // directory request
+			{path: "/ui", want: http.StatusOK, body: "test index"},
+			{path: "/ui/", want: http.StatusOK, body: "test index"},
+		}
+		for _, c := range cases {
+			req := httptest.NewRequest(http.MethodGet, c.path, nil)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+			if w.Code != c.want {
+				t.Errorf("%s %s: code = %d, want %d (body %q)", fsName, c.path, w.Code, c.want, w.Body.String())
+				continue
+			}
+			if c.body != "" && w.Body.String() != c.body {
+				t.Errorf("%s %s: body = %q, want %q", fsName, c.path, w.Body.String(), c.body)
+			}
+		}
+	}
+}

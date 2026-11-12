@@ -111,6 +111,16 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// An unclean path (an empty segment from "//", e.g. /ui//app.js) is not a
+	// valid fs path. os.DirFS rejects it with fs.ErrInvalid, which would
+	// otherwise surface as a client-triggerable 500, and other FSes report it as
+	// not-exist and fall back to the index; answer 404 on every FS instead.
+	// ("." and ".." segments are already caught as hidden segments above.)
+	if !fs.ValidPath(reqPath) {
+		http.NotFound(w, r)
+		return
+	}
+
 	// fs.Stat opens and closes internally (via the StatFS fast path that both
 	// os.DirFS and embed.FS implement), so it leaks no descriptor; the file
 	// itself is opened exactly once, by http.FileServerFS below.
