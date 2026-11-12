@@ -1,9 +1,11 @@
 package spa
 
 import (
+	"bytes"
 	_ "embed"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"strings"
@@ -23,7 +25,12 @@ type Cfg struct {
 	PathPrefix string
 }
 
+// indexFile is the SPA entrypoint served for the root and every deep link.
+const indexFile = "index.html"
+
 // New returns a Handler serving the single-page application described by cfg.
+// It returns an error if the served tree (FS, after SubDir) has no index.html
+// file.
 func New(cfg Cfg) (Handler, error) {
 	if cfg.FS == nil {
 		return Handler{}, fmt.Errorf("spa: Cfg.FS cannot be nil")
@@ -35,6 +42,16 @@ func New(cfg Cfg) (Handler, error) {
 			return Handler{}, err
 		}
 		assets = sub
+	}
+	// Validate the entrypoint up front: fs.Sub does not check that SubDir
+	// exists, so a typo, the parent of the build dir, or a missing build would
+	// otherwise only surface as 404s or directory listings on every deep link.
+	info, err := fs.Stat(assets, indexFile)
+	if err != nil {
+		return Handler{}, fmt.Errorf("spa: %s not found in FS (SubDir %q): %w", indexFile, cfg.SubDir, err)
+	}
+	if info.IsDir() {
+		return Handler{}, fmt.Errorf("spa: %s in FS (SubDir %q) is a directory", indexFile, cfg.SubDir)
 	}
 	return Handler{
 		fs:         assets,
@@ -112,9 +129,43 @@ func hasHiddenSegment(p string) bool {
 	return false
 }
 
-// serveIndex serves the SPA entrypoint by rewriting the request to the FS root
-// and delegating to the file server.
+// serveIndex serves the SPA entrypoint with http.ServeContent rather than a
+// file server on "/", so it can never fall back to a directory listing: if
+// index.html has gone missing (e.g. an os.DirFS build dir mid-rebuild) the
+// response is a 404. ServeContent sets the same Content-Type, Last-Modified,
+// and conditional/range handling the file server did.
 func (h Handler) serveIndex(w http.ResponseWriter, r *http.Request) {
-	r.URL.Path = "/"
-	http.FileServerFS(h.fs).ServeHTTP(w, r)
+	f, err := h.fs.Open(indexFile)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	defer func() { _ = f.Close() }()
+
+	info, err := f.Stat()
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	if info.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+
+	content, ok := f.(io.ReadSeeker)
+	if !ok {
+		// os.DirFS, embed.FS, and fstest.MapFS files all seek; buffer any FS
+		// whose files do not, so ServeContent can still size and range them.
+		data, err := io.ReadAll(f)
+		if err != nil {
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
+		content = bytes.NewReader(data)
+	}
+	http.ServeContent(w, r, indexFile, info.ModTime(), content)
 }

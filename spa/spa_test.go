@@ -211,3 +211,122 @@ func TestHandlerNormalizesPathPrefix(t *testing.T) {
 		}
 	}
 }
+
+// A SubDir that does not hold index.html — the parent of the build dir, a
+// missing build output, or a path that does not exist — must fail at New
+// instead of serving a directory listing (or a 404) for every deep link.
+func TestNewRequiresIndex(t *testing.T) {
+	fsys := fstest.MapFS{
+		"web/dist/index.html":   {Data: []byte("test index")},
+		"web/.env":              {Data: []byte("SECRET=1")},
+		"dirindex/index.html/x": {Data: []byte("not a file")},
+	}
+	for _, sub := range []string{"web", "missing", "dirindex"} {
+		if _, err := New(Cfg{FS: fsys, SubDir: sub}); err == nil {
+			t.Errorf("SubDir %q: New must reject a tree without an index.html file", sub)
+		}
+	}
+	if _, err := New(Cfg{FS: fsys, SubDir: "web/dist"}); err != nil {
+		t.Errorf("SubDir web/dist: unexpected error %v", err)
+	}
+}
+
+// Deep links serve index.html itself, never a directory listing, with the
+// same content headers the file server set.
+func TestHandlerServesIndexForDeepLinks(t *testing.T) {
+	h, err := New(Cfg{FS: mapFS(), PathPrefix: "/ui"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"/ui/", "/ui/users/42", "/ui/assets", "/ui/assets/"} {
+		req := httptest.NewRequest(http.MethodGet, p, nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusOK || w.Body.String() != "test index" {
+			t.Errorf("%s: code=%d body=%q, want 200 index", p, w.Code, w.Body.String())
+		}
+		if ct := w.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
+			t.Errorf("%s: Content-Type = %q, want text/html", p, ct)
+		}
+	}
+}
+
+// If index.html vanishes after New (an os.DirFS build dir being rebuilt), a
+// deep link must 404 rather than fall back to a directory listing.
+func TestHandlerNeverListsDirectory(t *testing.T) {
+	fsys := mapFS()
+	h, err := New(Cfg{FS: fsys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(fsys, "index.html")
+	req := httptest.NewRequest(http.MethodGet, "/users/42", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound || strings.Contains(w.Body.String(), "assets") {
+		t.Errorf("code=%d body=%q, want 404 without a listing", w.Code, w.Body.String())
+	}
+}
+
+// noSeekFS hides Seek on its files, and can fail Open with a non-NotExist error
+// after construction, to exercise serveIndex's fallback and error paths.
+type noSeekFS struct {
+	fstest.MapFS
+	openErr error
+}
+
+type noSeekFile struct{ fs.File }
+
+func (f noSeekFS) Open(name string) (fs.File, error) {
+	if f.openErr != nil && name == "index.html" {
+		return nil, f.openErr
+	}
+	file, err := f.MapFS.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return noSeekFile{file}, nil
+}
+
+func TestHandlerServeIndexEdgeCases(t *testing.T) {
+	get := func(h Handler) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/users/42", nil))
+		return w
+	}
+
+	t.Run("non-seekable file is buffered", func(t *testing.T) {
+		h, err := New(Cfg{FS: noSeekFS{MapFS: mapFS()}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w := get(h); w.Code != http.StatusOK || w.Body.String() != "test index" {
+			t.Errorf("code=%d body=%q, want 200 index", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("index replaced by a directory", func(t *testing.T) {
+		fsys := mapFS()
+		h, err := New(Cfg{FS: fsys})
+		if err != nil {
+			t.Fatal(err)
+		}
+		delete(fsys, "index.html")
+		fsys["index.html/x"] = &fstest.MapFile{Data: []byte("x")}
+		if w := get(h); w.Code != http.StatusNotFound {
+			t.Errorf("code=%d, want 404", w.Code)
+		}
+	})
+
+	t.Run("open error is a 500", func(t *testing.T) {
+		fsys := &noSeekFS{MapFS: mapFS()}
+		h, err := New(Cfg{FS: fsys})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fsys.openErr = fs.ErrPermission
+		if w := get(h); w.Code != http.StatusInternalServerError {
+			t.Errorf("code=%d, want 500", w.Code)
+		}
+	})
+}

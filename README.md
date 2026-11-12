@@ -167,6 +167,10 @@ spaHandler, err := spa.New(spa.Cfg{FS: embeddedFS, SubDir: "dist", PathPrefix: "
 - `SubDir` — sub-directory within the FS to serve from (empty for the FS root)
 - `PathPrefix` — URL path the SPA is mounted under; normalised to a single leading slash, so `ui`, `/ui`, and `/ui/` are equivalent (empty mounts at the root)
 
+`New` returns an error if the served tree (`FS` after `SubDir`) has no `index.html` file,
+so a mistyped `SubDir` or a missing build fails at startup. The entrypoint is served
+directly, never as a directory listing.
+
 Dotfiles are not served — `GET /.env` or `/.git/config` returns 404 — except the standard
 `.well-known/` tree. A plain `//go:embed dist` already keeps dotfiles out of the binary
 (prefer it to `//go:embed all:dist`); the serve-time block is the defense for `os.DirFS`
