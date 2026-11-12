@@ -288,6 +288,12 @@ func sleep(ctx context.Context, d time.Duration) error {
 // "404 = no data here", which is not an error for most providers); every other
 // non-2xx becomes an *Error.
 //
+// If ctx ends (or the throttle fails) after an attempt already failed upstream,
+// the returned error wraps both: errors.As finds that upstream *Error, whose
+// Kind still decides HTTPStatus and UserMessage, and errors.Is matches the
+// context error. Before any upstream failure, the context error is returned
+// as-is.
+//
 // On success the caller owns resp.Body and must close it.
 func (c *Client) Get(ctx context.Context, url string, header http.Header, allowStatus ...int) (*http.Response, error) {
 	attempts := c.maxAttempts
@@ -301,7 +307,7 @@ func (c *Client) Get(ctx context.Context, url string, header http.Header, allowS
 				wait = last.retryAfter
 			}
 			if err := c.wait(ctx, wait); err != nil {
-				return nil, err
+				return nil, withLast(last, err)
 			}
 			backoff *= 2
 		}
@@ -312,7 +318,7 @@ func (c *Client) Get(ctx context.Context, url string, header http.Header, allowS
 			// them as-is and do not burn retries on them.
 			var uerr *Error
 			if !errors.As(err, &uerr) {
-				return nil, err
+				return nil, withLast(last, err)
 			}
 			uerr.Attempts = attempt
 			if !uerr.retryable {
@@ -339,6 +345,20 @@ func (c *Client) Get(ctx context.Context, url string, header http.Header, allowS
 		last = &Error{Service: c.service, Kind: KindUnavailable, Attempts: attempts}
 	}
 	return nil, last
+}
+
+// withLast attaches the upstream failure of a previous attempt to err, an
+// error of our own (a cancelled context, an expired deadline, the throttle)
+// that cut the retry loop short. Dropping last would turn a precise upstream
+// failure into a bare "context canceled" that callers can only render
+// generically, so both stay in the chain: errors.As finds the *Error — whose
+// Kind decides HTTPStatus and UserMessage — and errors.Is still matches the
+// context error. With no previous failure, err is returned unchanged.
+func withLast(last *Error, err error) error {
+	if last == nil {
+		return err
+	}
+	return fmt.Errorf("%w: %w", last, err)
 }
 
 // do performs one throttled request, classifying transport failures.

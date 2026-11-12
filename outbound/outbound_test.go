@@ -349,6 +349,49 @@ func TestGetClampsRetryAfterToCap(t *testing.T) {
 	}
 }
 
+// When the caller's context ends during the backoff after an upstream 503, the
+// upstream failure must not be lost: the returned error still carries the
+// typed *Error (so HTTPStatus/UserMessage stay precise) and also reports the
+// context error, so errors.Is(err, context.Canceled) keeps working.
+func TestGetKeepsUpstreamErrorWhenContextEndsDuringBackoff(t *testing.T) {
+	for _, ctxErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(ctxErr.Error(), func(t *testing.T) {
+			var hits int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				atomic.AddInt32(&hits, 1)
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}))
+			defer srv.Close()
+
+			c := New(Cfg{
+				Service: "Example Service",
+				Client:  srv.Client(),
+				Wait: func(context.Context, time.Duration) error {
+					return ctxErr // the context ends while we back off
+				},
+			})
+			_, err := c.Get(context.Background(), srv.URL, nil)
+
+			var uerr *Error
+			if !errors.As(err, &uerr) {
+				t.Fatalf("want *outbound.Error in the chain, got %T: %v", err, err)
+			}
+			if uerr.Status != http.StatusServiceUnavailable || uerr.Kind != KindUnavailable {
+				t.Fatalf("upstream error lost: kind=%v status=%d", uerr.Kind, uerr.Status)
+			}
+			if !errors.Is(err, ctxErr) {
+				t.Fatalf("errors.Is(err, %v) = false; err = %v", ctxErr, err)
+			}
+			if got := HTTPStatus(err); got != http.StatusBadGateway {
+				t.Fatalf("HTTPStatus = %d, want 502", got)
+			}
+			if n := atomic.LoadInt32(&hits); n != 1 {
+				t.Fatalf("want 1 attempt before the backoff was cut short, got %d", n)
+			}
+		})
+	}
+}
+
 // Retry-After may be an HTTP-date instead of delay-seconds; it is parsed and
 // then clamped to the cap like any other wait.
 func TestGetParsesHTTPDateRetryAfter(t *testing.T) {
