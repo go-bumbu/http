@@ -337,6 +337,27 @@ func TestRoute_CaptureRoute(t *testing.T) {
 		})
 	}
 
+	t.Run("matches what the mux records", func(t *testing.T) {
+		tree := http.NewServeMux()
+		tree.Handle("/tree/", testHandler(200, "ok"))
+		tree.Handle("POST /form", testHandler(200, "ok"))
+		for _, target := range []string{"/tree/x", "/tree", "/a/../tree/x", "/form", "/nope"} {
+			if got, want := serve(t, middleware.Cfg{}, withContext(middleware.CaptureRoute(tree)), target), serve(t, middleware.Cfg{}, tree, target); got != want {
+				t.Errorf("%s: route = %q, want %q", target, got, want)
+			}
+		}
+	})
+
+	// A CaptureRoute around a handler that is not a ServeMux records after it returns; an
+	// outer CaptureRoute around a ServeMux records before dispatch, and must not block it.
+	t.Run("inner non-mux capture beats outer mux capture", func(t *testing.T) {
+		outer := http.NewServeMux()
+		outer.Handle("/api/", http.StripPrefix("/api", middleware.CaptureRoute(http.HandlerFunc(inner.ServeHTTP))))
+		if got := serve(t, middleware.Cfg{}, middleware.CaptureRoute(outer), "/api/users/1"); got != "GET /users/{id}" {
+			t.Errorf("route = %q, want %q", got, "GET /users/{id}")
+		}
+	})
+
 	t.Run("without a Middleware", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		middleware.CaptureRoute(mux).ServeHTTP(rec, httptest.NewRequest("GET", "/users/1", nil))
@@ -344,6 +365,40 @@ func TestRoute_CaptureRoute(t *testing.T) {
 			t.Errorf("status = %d, want 200", rec.Code)
 		}
 	})
+}
+
+type statusRouteSpy struct {
+	status int
+	route  string
+}
+
+func (s *statusRouteSpy) Observe(status int, r *http.Request, _ time.Duration) {
+	s.status = status
+	s.route = middleware.Route(r)
+}
+
+// TestRoute_CaptureRouteTimeout: when http.TimeoutHandler times out, the Middleware
+// resolves the route while the mux handler is still running, so CaptureRoute must record
+// the pattern before dispatch, not after the mux returns.
+func TestRoute_CaptureRouteTimeout(t *testing.T) {
+	release := make(chan struct{})
+	done := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.Handle("GET /slow/{id}", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		defer close(done)
+		<-release
+	}))
+
+	spy := &statusRouteSpy{}
+	h := middleware.New(middleware.Cfg{Metrics: spy}).
+		Wrap(http.TimeoutHandler(middleware.CaptureRoute(mux), 50*time.Millisecond, "timeout"))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/slow/1", nil))
+	close(release)
+	<-done
+
+	if spy.status != http.StatusServiceUnavailable || spy.route != "GET /slow/{id}" {
+		t.Errorf("status = %d, route = %q, want %d and %q", spy.status, spy.route, http.StatusServiceUnavailable, "GET /slow/{id}")
+	}
 }
 
 func TestRoute_Groups(t *testing.T) {

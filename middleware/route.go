@@ -20,6 +20,22 @@ type routeSlot struct {
 	set      string // from SetRoute
 	captured string // from the innermost CaptureRoute whose ServeMux matched
 	resolved string // final route, written by the Middleware before it calls the Observer
+
+	captures   int // CaptureRoute calls entered so far; the innermost is entered last
+	capturedBy int // entry order of the CaptureRoute that wrote captured
+}
+
+// capture records pattern from the CaptureRoute entered at position order, unless a
+// CaptureRoute entered later (an inner one) has already recorded its own.
+func (s *routeSlot) capture(order int, pattern string) {
+	if pattern == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if order > s.capturedBy {
+		s.captured, s.capturedBy = pattern, order
+	}
 }
 
 // source returns the reported route: SetRoute, else CaptureRoute, else pattern.
@@ -82,27 +98,34 @@ func SetRoute(r *http.Request, route string) {
 // innermost CaptureRoute whose mux matched, else the pattern the Middleware itself sees. So
 // with a mux mounted under another through http.StripPrefix, wrap the inner mux to record its
 // pattern rather than the outer prefix ("/api/"). The inner pattern is relative to the
-// stripped path ("GET /users/{id}", not "/api/users/{id}"). CaptureRoute reports the pattern
-// even if the handler panics, and is a no-op on a request that did not pass through a
-// Middleware with metrics enabled.
+// stripped path ("GET /users/{id}", not "/api/users/{id}").
+//
+// Around an *http.ServeMux, CaptureRoute looks the pattern up (ServeMux.Handler) before
+// dispatching, so the route is recorded even when http.TimeoutHandler times out and the
+// Middleware observes the 503 while the handler is still running, and even if the handler
+// panics. Around any other handler it records r.Pattern after the handler returns (also on
+// panic). CaptureRoute is a no-op on a request that did not pass through a Middleware with
+// metrics enabled.
 func CaptureRoute(mux http.Handler) http.Handler {
+	sm, isMux := mux.(*http.ServeMux)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s, ok := r.Context().Value(routeKey{}).(*routeSlot)
 		if !ok {
 			mux.ServeHTTP(w, r)
 			return
 		}
-		defer func() {
-			if r.Pattern == "" {
-				return
-			}
-			s.mu.Lock()
-			defer s.mu.Unlock()
-			// An inner CaptureRoute returns first: keep its more specific pattern.
-			if s.captured == "" {
-				s.captured = r.Pattern
-			}
-		}()
+		s.mu.Lock()
+		s.captures++
+		order := s.captures
+		s.mu.Unlock()
+
+		// ServeMux.ServeHTTP answers "*" itself without matching, so leave it unrecorded.
+		if isMux && r.RequestURI != "*" {
+			_, pattern := sm.Handler(r)
+			s.capture(order, pattern)
+		} else {
+			defer func() { s.capture(order, r.Pattern) }()
+		}
 		mux.ServeHTTP(w, r)
 	})
 }
