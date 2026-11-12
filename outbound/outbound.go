@@ -375,6 +375,13 @@ func (c *Client) get(ctx context.Context, url string, header http.Header, allowS
 			if last != nil && last.retryAfter > 0 {
 				wait = last.retryAfter
 			}
+			// A wait that would outlast the deadline (the Cfg.Timeout budget or
+			// the caller's own) can never lead to another attempt: fail now
+			// with the error sleeping it out would end in, rather than burning
+			// the rest of the latency budget first.
+			if deadline, ok := ctx.Deadline(); ok && wait > time.Until(deadline) {
+				return nil, withLast(last, context.DeadlineExceeded)
+			}
 			if err := c.wait(ctx, wait); err != nil {
 				return nil, withLast(last, err)
 			}
