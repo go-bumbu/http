@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -197,14 +198,27 @@ func UserMessage(err error, fallback string) string {
 // them at construction rather than mutating a Client after New.
 type Cfg struct {
 	// Service is the provider's display name, used in error messages.
-	Service   string
+	Service string
+	// UserAgent is the default User-Agent; a User-Agent in Get's header
+	// argument overrides it for that call.
 	UserAgent string
 	// RPS throttles requests to this many per second (burst 1). A value <= 0
 	// leaves the client unthrottled.
 	RPS float64
 
-	// Client overrides the default *http.Client (20s timeout).
+	// Client overrides the default *http.Client (20s timeout). Its timeout
+	// bounds each attempt, not the whole call; see Timeout.
 	Client *http.Client
+	// Timeout is an overall budget for one Get call: every attempt, the
+	// backoff and Retry-After waits between them, and reading the response
+	// body (like http.Client.Timeout, it stays armed until the caller closes
+	// the body). When it runs out, Get stops retrying: if an attempt already
+	// failed upstream, that *Error is returned (see Get); otherwise the call
+	// fails as a KindTimeout *Error. Either way errors.Is(err,
+	// context.DeadlineExceeded) holds. Zero (or negative) adds no budget, so a
+	// call is bounded only by ctx and MaxAttempts × the per-attempt timeout
+	// plus backoff — about a minute with the defaults.
+	Timeout time.Duration
 	// Limiter overrides the limiter built from RPS.
 	Limiter *rate.Limiter
 	// MaxAttempts bounds the total number of requests per call (1 = no retry);
@@ -232,6 +246,7 @@ type Client struct {
 	maxAttempts   int
 	backoff       time.Duration
 	retryAfterCap time.Duration
+	timeout       time.Duration
 	wait          func(ctx context.Context, d time.Duration) error
 }
 
@@ -246,6 +261,7 @@ func New(cfg Cfg) *Client {
 		maxAttempts:   cfg.MaxAttempts,
 		backoff:       cfg.Backoff,
 		retryAfterCap: cfg.RetryAfterCap,
+		timeout:       cfg.Timeout,
 		wait:          cfg.Wait,
 	}
 	if c.client == nil {
@@ -288,8 +304,67 @@ func sleep(ctx context.Context, d time.Duration) error {
 // "404 = no data here", which is not an error for most providers); every other
 // non-2xx becomes an *Error.
 //
+// If ctx ends (or the throttle fails) after an attempt already failed upstream,
+// the returned error wraps both: errors.As finds that upstream *Error, whose
+// Kind still decides HTTPStatus and UserMessage, and errors.Is matches the
+// context error. Before any upstream failure, the context error is returned
+// as-is.
+//
+// Cfg.Timeout, when set, bounds the whole call including the body read.
+//
+// Each header name in header replaces the client's default for that name (e.g.
+// Cfg.UserAgent); multiple values under one name are all sent.
+//
 // On success the caller owns resp.Body and must close it.
 func (c *Client) Get(ctx context.Context, url string, header http.Header, allowStatus ...int) (*http.Response, error) {
+	if c.timeout <= 0 {
+		return c.get(ctx, url, header, allowStatus)
+	}
+	bctx, cancel := context.WithTimeout(ctx, c.timeout)
+	resp, err := c.get(bctx, url, header, allowStatus)
+	if err != nil {
+		budgetSpent := ctx.Err() == nil &&
+			(bctx.Err() != nil || (errors.Is(err, context.DeadlineExceeded) && budgetIsEarliest(ctx, bctx)))
+		cancel()
+		var uerr *Error
+		if budgetSpent && !errors.As(err, &uerr) {
+			// Our own budget ran out before any upstream failure: that is the
+			// provider being too slow, not the caller giving up.
+			return nil, &Error{Service: c.service, Kind: KindTimeout, Err: err, Attempts: 1}
+		}
+		return nil, err
+	}
+	// The budget covers the body read, so release it only when the caller
+	// closes the body.
+	resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
+}
+
+// budgetIsEarliest reports whether bctx's deadline (the Cfg.Timeout budget) is
+// earlier than the caller ctx's own. A deadline error raised before either
+// expires (a throttle wait refused for outlasting the deadline) is then ours,
+// not the caller's.
+func budgetIsEarliest(ctx, bctx context.Context) bool {
+	budget, _ := bctx.Deadline()
+	caller, ok := ctx.Deadline()
+	return !ok || budget.Before(caller)
+}
+
+// cancelOnClose releases a Get's time budget when the response body is closed.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnClose) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
+}
+
+// get is the retry loop behind Get, running under ctx (already carrying the
+// Cfg.Timeout budget when one is set).
+func (c *Client) get(ctx context.Context, url string, header http.Header, allowStatus []int) (*http.Response, error) {
 	attempts := c.maxAttempts
 	backoff := c.backoff
 	var last *Error
@@ -300,8 +375,15 @@ func (c *Client) Get(ctx context.Context, url string, header http.Header, allowS
 			if last != nil && last.retryAfter > 0 {
 				wait = last.retryAfter
 			}
+			// A wait that would outlast the deadline (the Cfg.Timeout budget or
+			// the caller's own) can never lead to another attempt: fail now
+			// with the error sleeping it out would end in, rather than burning
+			// the rest of the latency budget first.
+			if deadline, ok := ctx.Deadline(); ok && wait > time.Until(deadline) {
+				return nil, withLast(last, context.DeadlineExceeded)
+			}
 			if err := c.wait(ctx, wait); err != nil {
-				return nil, err
+				return nil, withLast(last, err)
 			}
 			backoff *= 2
 		}
@@ -312,7 +394,7 @@ func (c *Client) Get(ctx context.Context, url string, header http.Header, allowS
 			// them as-is and do not burn retries on them.
 			var uerr *Error
 			if !errors.As(err, &uerr) {
-				return nil, err
+				return nil, withLast(last, err)
 			}
 			uerr.Attempts = attempt
 			if !uerr.retryable {
@@ -327,7 +409,7 @@ func (c *Client) Get(ctx context.Context, url string, header http.Header, allowS
 		}
 
 		serr := c.statusError(resp)
-		_ = resp.Body.Close()
+		discardBody(resp.Body)
 		serr.Attempts = attempt
 		if !serr.retryable {
 			return nil, serr
@@ -341,6 +423,34 @@ func (c *Client) Get(ctx context.Context, url string, header http.Header, allowS
 	return nil, last
 }
 
+// maxDrainBytes bounds how much of a discarded response body is read so its
+// keep-alive connection can be reused; a larger body is not worth reading and
+// the Transport simply closes that connection.
+const maxDrainBytes = 64 << 10
+
+// discardBody drains (up to maxDrainBytes) and closes a response body we will
+// not return. Closing an unread body makes the Transport drop the connection,
+// so every retry during a 5xx/429 storm would otherwise open a new TCP/TLS
+// connection.
+func discardBody(body io.ReadCloser) {
+	_, _ = io.CopyN(io.Discard, body, maxDrainBytes)
+	_ = body.Close()
+}
+
+// withLast attaches the upstream failure of a previous attempt to err, an
+// error of our own (a cancelled context, an expired deadline, the throttle)
+// that cut the retry loop short. Dropping last would turn a precise upstream
+// failure into a bare "context canceled" that callers can only render
+// generically, so both stay in the chain: errors.As finds the *Error — whose
+// Kind decides HTTPStatus and UserMessage — and errors.Is still matches the
+// context error. With no previous failure, err is returned unchanged.
+func withLast(last *Error, err error) error {
+	if last == nil {
+		return err
+	}
+	return fmt.Errorf("%w: %w", last, err)
+}
+
 // do performs one throttled request, classifying transport failures.
 func (c *Client) do(ctx context.Context, url string, header http.Header) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -350,6 +460,13 @@ func (c *Client) do(ctx context.Context, url string, header http.Header) (*http.
 	if c.userAgent != "" {
 		req.Header.Set("User-Agent", c.userAgent)
 	}
+	// Each caller header replaces any default under the same name (so a
+	// per-call User-Agent wins over Cfg.UserAgent instead of being dropped by
+	// the Transport, which sends only the first value) while keeping all of the
+	// caller's own values for that name.
+	for k := range header {
+		req.Header.Del(k)
+	}
 	for k, vals := range header {
 		for _, v := range vals {
 			req.Header.Add(k, v)
@@ -357,7 +474,7 @@ func (c *Client) do(ctx context.Context, url string, header http.Header) (*http.
 	}
 	if c.limiter != nil {
 		if err := c.limiter.Wait(ctx); err != nil {
-			return nil, fmt.Errorf("%s throttle: %w", c.service, err)
+			return nil, c.throttleError(ctx, err)
 		}
 	}
 	resp, err := c.client.Do(req)
@@ -374,6 +491,21 @@ func (c *Client) do(ctx context.Context, url string, header http.Header) (*http.
 		return nil, &Error{Service: c.service, Kind: kind, Err: err, retryable: true}
 	}
 	return resp, nil
+}
+
+// throttleError wraps a failed limiter wait. rate.Limiter fails a wait that
+// would outlast ctx's deadline at once, before the deadline arrives, with an
+// error that does not match context.DeadlineExceeded (and ctx.Err() is still
+// nil). That is the deadline running out all the same, so it is made to match
+// context.DeadlineExceeded; a limiter whose burst can never admit a request
+// fails for an unrelated reason and is left as-is.
+func (c *Client) throttleError(ctx context.Context, err error) error {
+	_, hasDeadline := ctx.Deadline()
+	burstFailure := c.limiter.Burst() < 1 && c.limiter.Limit() != rate.Inf
+	if hasDeadline && ctx.Err() == nil && !burstFailure {
+		return fmt.Errorf("%s throttle: %w: %w", c.service, context.DeadlineExceeded, err)
+	}
+	return fmt.Errorf("%s throttle: %w", c.service, err)
 }
 
 // statusError classifies a non-2xx response. 5xx and 429 are transient (worth

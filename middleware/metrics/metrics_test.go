@@ -136,6 +136,43 @@ func TestObserver_PatternLabel(t *testing.T) {
 	}
 }
 
+// TestObserver_RouteLabel verifies the "addr" label follows the middleware's route
+// resolution for non-ServeMux routers: a route set with SetRoute, and RouteGroups
+// collapsing sub-routes into one series.
+func TestObserver_RouteLabel(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	obs, err := metrics.NewObserver(metrics.Cfg{Registry: reg})
+	if err != nil {
+		t.Fatalf("NewObserver: %v", err)
+	}
+	// Stands in for a gorilla/chi router reporting its matched template.
+	router := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/users/1", "/users/2":
+			middleware.SetRoute(r, "/users/{id}")
+		case "/api/apple":
+			middleware.SetRoute(r, "/api/apple")
+		case "/api/banana":
+			middleware.SetRoute(r, "/api/banana")
+		}
+		w.WriteHeader(200)
+	})
+	h := middleware.New(middleware.Cfg{Metrics: obs, RouteGroups: []string{"/api"}}).Wrap(router)
+	for _, p := range []string{"/users/1", "/users/2", "/api/apple", "/api/banana"} {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", p, nil))
+	}
+
+	body := scrape(t, reg)
+	for _, want := range []string{
+		`requests_http_duration_seconds_count{addr="/users/{id}",method="GET",status="200",type="HTTP/1.1"} 2`,
+		`requests_http_duration_seconds_count{addr="/api",method="GET",status="200",type="HTTP/1.1"} 2`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing expected series:\n%s\nmetrics:\n%s", want, body)
+		}
+	}
+}
+
 // TestNopObserver verifies NopObserver is a non-nil Observer that is safe to call
 // directly and leaves the response untouched — this is the sharp edge a nil
 // interface sentinel would hit.

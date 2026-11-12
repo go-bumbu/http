@@ -43,6 +43,30 @@ mux.Handle("/", m.Wrap(handler))
 
 It depends only on the standard library; Prometheus is pulled in only when you import `middleware/metrics`.
 
+Panics are logged and recorded once, then handled like net/http does:
+
+- `PanicRecover: true`, response not started yet: the client gets a `500 Internal Server Error` and `Wrap` returns normally.
+- `PanicRecover: true`, response already started (a status written, body bytes written, flushed, or hijacked): a 500 can no longer be sent, so `Wrap` re-panics with `http.ErrAbortHandler` and net/http aborts the connection, letting the client detect the truncated reply. A handler's own `http.ErrAbortHandler` panic (e.g. from `httputil.ReverseProxy`) is passed through the same way.
+- `PanicRecover: false`: nothing is written; the panic is recorded (as a 500 if no status was sent) and carries on out of `Wrap`.
+
+So a panic can escape `Wrap` either way: an outer recoverer will see it, and a test that calls the handler directly with `httptest.ResponseRecorder` must expect the panic rather than a normal return.
+
+The logged `url` field is the request path only: the query string is never logged, since it often carries tokens or signatures.
+
+The logged `ip` field is the direct peer by default; forwarding headers are ignored because any client can set them. Behind a reverse proxy, tell the middleware which proxies to trust so it logs the real client:
+
+```go
+middleware.Cfg{
+    Logger:   slog.Default(),
+    ClientIP: middleware.ClientIPFromXFF(netip.MustParsePrefix("10.0.0.0/8")),
+}
+```
+
+- `ClientIPDirect` — the peer address, no headers (default)
+- `ClientIPFromRealIP(trusted...)` — `X-Real-Ip`, when the peer is a trusted proxy
+- `ClientIPFromXFF(trusted...)` — `X-Forwarded-For`, walked right to left past trusted proxies
+- `ClientIPFromXFFHops(n)` — `X-Forwarded-For` by position, for proxies without a stable address range
+
 `ReqDelay` is a standalone, development-only helper: `middleware.ReqDelay{...}.Delay` adds a random delay between a min and max duration to simulate slow backends.
 
 #### middleware/metrics
@@ -52,6 +76,104 @@ histogram and wraps it as a `middleware.Observer` for `middleware.Cfg.Metrics`
 (`NopObserver` returns an explicit no-op). Request labels are bounded to closed sets
 to avoid time-series cardinality blow-ups. This is the only package that imports the
 Prometheus client, so importing `middleware` alone stays dependency-free.
+
+#### Route labels
+
+Metrics are labelled by route template (`/users/{id}`), never by raw path, so
+`/users/1` and `/users/2` share one series. The middleware resolves the route after the
+handler runs, by one rule: the innermost reporter wins. A reporter is a
+`middleware.SetRoute` call or a `middleware.CaptureRoute` whose mux matched, and
+"innermost" means nested inside the most `CaptureRoute`s, whether it reports before or
+after the handler. At equal depth `SetRoute` wins; empty reports (a mux miss,
+`SetRoute(r, "")`) are ignored. With no report the middleware uses the `http.ServeMux`
+pattern it sees; anything else records as `unmatched`. `Cfg.RouteGroups` is applied to
+the result.
+
+With `http.ServeMux` directly under the middleware nothing is needed. When another
+wrapper sits in between and passes a request copy down (`r.WithContext` in an auth or
+tracing middleware, `http.TimeoutHandler`, `http.MaxBytesHandler`, `http.StripPrefix`),
+the mux writes its pattern onto a copy the middleware never sees, and every request
+records as `unmatched`. Wrap the mux in `CaptureRoute`, directly around it:
+
+```go
+http.ListenAndServe(":8080", m.Wrap(auth(middleware.CaptureRoute(mux))))
+```
+
+For a mux mounted under another router or mux with `http.StripPrefix`, wrap the inner
+mux in `CaptureRoute`: its pattern wins over the outer template (`/api/`, gorilla's
+`/api/{version}/`, chi's `/api/*`), and the outer one is kept when the inner mux has no
+match. The inner pattern is relative to the stripped path (`GET /users/{id}`, not
+`/api/users/{id}`), so mounting the same mux under `/v1` and `/v2` shares its series.
+To keep the full path, register the inner mux with full patterns
+(`GET /api/users/{id}`) and skip `StripPrefix`.
+
+This rule changed label values in mixed router setups: an outer `SetRoute` used to win
+over an inner `CaptureRoute`, so such routes now record the inner, relative pattern
+instead of the outer template. Check dashboards and `RouteGroups` after upgrading: an
+`/api` group does not match a relative inner pattern like `GET /users/{id}`.
+
+Other routers report their match with `SetRoute`, from a router-level middleware.
+gorilla/mux:
+
+```go
+// Reports gorilla's matched template. gorilla runs Use middlewares after matching.
+setGorillaRoute := func(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if route := mux.CurrentRoute(r); route != nil {
+            if tmpl, err := route.GetPathTemplate(); err == nil {
+                middleware.SetRoute(r, tmpl)
+            }
+        }
+        next.ServeHTTP(w, r)
+    })
+}
+m := middleware.New(middleware.Cfg{Metrics: obs})
+router := mux.NewRouter()
+
+// A) wrap the whole router: every request is seen, including 404/405.
+router.Use(setGorillaRoute)
+http.ListenAndServe(":8080", m.Wrap(router))
+
+// B) or inside the router. Order matters: m.Wrap first, so the setter runs inside it.
+// gorilla skips Use middlewares for 404/405, so wrap those handlers too.
+router.Use(m.Wrap, setGorillaRoute)
+router.NotFoundHandler = m.Wrap(http.NotFoundHandler())
+router.MethodNotAllowedHandler = m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+    http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+}))
+```
+
+Use one setup, not both: every request would be logged and counted twice.
+
+chi runs `Use` middlewares *before* routing, so read the pattern after the handler:
+
+```go
+router := chi.NewRouter()
+router.Use(func(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        next.ServeHTTP(w, r)
+        middleware.SetRoute(r, chi.RouteContext(r.Context()).RoutePattern())
+    })
+})
+http.ListenAndServe(":8080", m.Wrap(router))
+```
+
+Pass `SetRoute` a template, never the raw path: each distinct value is a new series.
+
+Notes:
+- Route shapes differ by router: a `ServeMux` pattern keeps its method when registered
+  with one (`GET /users/{id}`), a gorilla or chi template has none (`/users/{id}`). The
+  method is always its own label as well.
+- With metrics on, handlers receive a copy of the request. The middleware copies
+  `r.Pattern` back for wrappers outside it, but not the path values: `r.PathValue` is
+  empty outside the middleware.
+
+`Cfg.RouteGroups` collapses routes under a prefix into one series:
+`RouteGroups: []string{"/api"}` records `GET /api/apple` and `GET /api/banana` as
+`GET /api`. Entries are paths (a method is stripped, a host is not supported); they
+match whole segments (`/api` does not group `/apiary`) and the longest wins. Groups
+match the resolved route, so a relative pattern from an inner `CaptureRoute`
+(`GET /users/{id}` under a stripped `/api`) is not in an `/api` group.
 
 ### spa
 
@@ -67,6 +189,10 @@ spaHandler, err := spa.New(spa.Cfg{FS: embeddedFS, SubDir: "dist", PathPrefix: "
 - `SubDir` — sub-directory within the FS to serve from (empty for the FS root)
 - `PathPrefix` — URL path the SPA is mounted under; normalised to a single leading slash, so `ui`, `/ui`, and `/ui/` are equivalent (empty mounts at the root)
 
+`New` returns an error if the served tree (`FS` after `SubDir`) has no `index.html` file,
+so a mistyped `SubDir` or a missing build fails at startup. The entrypoint is served
+directly, never as a directory listing.
+
 Dotfiles are not served — `GET /.env` or `/.git/config` returns 404 — except the standard
 `.well-known/` tree. A plain `//go:embed dist` already keeps dotfiles out of the binary
 (prefer it to `//go:embed all:dist`); the serve-time block is the defense for `os.DirFS`
@@ -81,22 +207,38 @@ timeouts), `Retry-After` compliance, and a typed `*Error` carrying both the tech
 detail (for logs) and a human-readable sentence naming the service (for the UI).
 
 ```go
-client := outbound.New(outbound.Cfg{Service: "Cover Art Archive", RPS: 5})
+client := outbound.New(outbound.Cfg{Service: "Cover Art Archive", RPS: 5, Timeout: 8 * time.Second})
 resp, err := client.Get(ctx, url, nil)
 // on failure: outbound.HTTPStatus(err) and outbound.UserMessage(err, fallback)
 ```
+
+The `Client`'s timeout (20s by default) bounds each attempt; set `Timeout` to cap the
+whole call — attempts, backoff, and the body read — for user-facing requests. If the
+context or budget ends after an upstream failure, the error still carries that
+`*Error` (and `errors.Is` matches the context error).
 
 This is the only package that pulls in `golang.org/x/time/rate`; the inbound packages above do not.
 
 ### problemjson
 
 Writes RFC 9457 (`application/problem+json`) error responses — one consistent,
-spec-shaped error body (a stable `type` URI, `title`/`detail`, and the request path
-as `instance`) in place of ad-hoc `{"error":...}` shapes. `ModeMasked` strips
-handler-supplied detail in production while keeping a correlation `reference`.
+spec-shaped error body (a stable `type` URI, `title`/`detail`, and the escaped
+request path as `instance`) in place of ad-hoc `{"error":...}` shapes. `ModeMasked` strips
+handler-supplied detail in production while keeping a correlation `reference`; set
+`OnProblem` to log the unmasked problem (same `reference`) so the real cause is not lost:
+it receives the `Details` plus the validation field errors, the upstream reason, and the
+upstream error, all of which a masked body omits.
 
 ```go
-pj, err := problemjson.New(problemjson.Cfg{BaseURI: "https://errors.example.com"})
+pj, err := problemjson.New(problemjson.Cfg{
+	BaseURI:   "https://errors.example.com",
+	Mode:      problemjson.ModeMasked,
+	RequestID: requestIDFrom, // func(*http.Request) string
+	OnProblem: func(r *http.Request, p problemjson.Problem) {
+		slog.Error("problem", "status", p.Status, "detail", p.Detail, "reference", p.Reference,
+			"fields", p.Errors, "reason", p.Reason, "err", p.Err)
+	},
+})
 // handle err
 pj.Write(w, r, http.StatusNotFound, problemjson.SlugNotFound, "no such release")
 pj.WriteUpstream(w, r, err, "The catalog is unavailable.") // maps an outbound.*Error
@@ -104,5 +246,6 @@ pj.WriteUpstream(w, r, err, "The catalog is unavailable.") // maps an outbound.*
 
 In dev mode, `WriteUpstream` adds an extra `reason` field naming the exact failure
 (e.g. `unreachable`) whenever the error can supply one through an optional
-`UpstreamReason() string` method (`outbound.*Error` does). `ModeMasked` strips it, and
+`UpstreamReason() string` method (`outbound.*Error` does). `ModeMasked` strips it from the
+body (`OnProblem` still gets it in `Problem.Reason`), and
 neither package imports the other — the reason travels through the method name alone.

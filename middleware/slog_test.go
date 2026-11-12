@@ -77,6 +77,40 @@ func TestSlogMiddleware(t *testing.T) {
 	}
 }
 
+// TestLog_URLOmitsQuery verifies that every log record (access, debug headers, panic) logs only
+// the request path: query strings often carry tokens or signatures that must not reach logs.
+func TestLog_URLOmitsQuery(t *testing.T) {
+	tcs := []struct {
+		name    string
+		handler http.Handler
+	}{
+		{name: "access and debug header log", handler: testHandler(200, "ok")},
+		{name: "panic log", handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("boom") })},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, logger := newMemSlog()
+			m := middleware.New(middleware.Cfg{Logger: logger, LogHeaders: true, PanicRecover: true})
+			handler := m.Wrap(tc.handler)
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/reset/a%2Fb?token=s3cret&page=2", nil)
+			handler.ServeHTTP(rec, req)
+
+			got := buf.String()
+			// The escaped path is kept so an encoded slash stays distinguishable from a real one.
+			if n := strings.Count(got, "url=/reset/a%2Fb "); n < 2 {
+				t.Errorf("expected at least 2 records with the escaped path, got %d\nfull log:\n%s", n, got)
+			}
+			for _, avoid := range []string{"token", "s3cret"} {
+				if strings.Contains(got, avoid) {
+					t.Errorf("log unexpectedly contained %q\nfull log:\n%s", avoid, got)
+				}
+			}
+		})
+	}
+}
+
 // TestLog_RequestID verifies the "req-id" field: the default extractor reads the Request-Id
 // header, and a Cfg.RequestID override reads whatever header (or context) it chooses.
 func TestLog_RequestID(t *testing.T) {

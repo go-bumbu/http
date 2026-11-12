@@ -215,6 +215,63 @@ func TestStatWriter_HijackSuppressesHeaderWrite(t *testing.T) {
 	}
 }
 
+// TestStatWriter_SwitchingProtocolsLatches verifies that 101 is treated as a final status:
+// it is recorded for logs/metrics and flushHeader does not write a second (200) header,
+// which net/http would log as "superfluous response.WriteHeader call".
+func TestStatWriter_SwitchingProtocolsLatches(t *testing.T) {
+	crw := &countingRW{}
+	sw := NewWriter(crw)
+
+	sw.WriteHeader(http.StatusSwitchingProtocols)
+	sw.flushHeader()
+
+	if sw.StatusCode() != http.StatusSwitchingProtocols {
+		t.Errorf("expected status 101, got %d", sw.StatusCode())
+	}
+	if crw.writeHeaderCalls != 1 {
+		t.Errorf("expected exactly 1 WriteHeader call, got %d", crw.writeHeaderCalls)
+	}
+	if !sw.Started() {
+		t.Error("a 101 response must count as started")
+	}
+}
+
+// TestStatWriter_HijackRecordsSwitchingProtocols verifies that a hijack with no status
+// written records 101 for logs/metrics (the handler owns the raw response, typically an
+// upgrade), without writing anything to the underlying writer.
+func TestStatWriter_HijackRecordsSwitchingProtocols(t *testing.T) {
+	hw := &hijackableRW{countingRW: countingRW{}}
+	sw := NewWriter(hw)
+
+	if _, _, err := sw.Hijack(); err != nil {
+		t.Fatalf("unexpected hijack error: %v", err)
+	}
+	sw.flushHeader()
+
+	if sw.StatusCode() != http.StatusSwitchingProtocols {
+		t.Errorf("expected status 101 after hijack, got %d", sw.StatusCode())
+	}
+	if hw.writeHeaderCalls != 0 {
+		t.Errorf("expected no WriteHeader after hijack, got %d calls", hw.writeHeaderCalls)
+	}
+}
+
+// TestStatWriter_HijackKeepsLatchedStatus verifies that a hijack after a final status was
+// already written keeps that status rather than overwriting it with 101.
+func TestStatWriter_HijackKeepsLatchedStatus(t *testing.T) {
+	hw := &hijackableRW{countingRW: countingRW{}}
+	sw := NewWriter(hw)
+
+	sw.WriteHeader(http.StatusBadRequest)
+	if _, _, err := sw.Hijack(); err != nil {
+		t.Fatalf("unexpected hijack error: %v", err)
+	}
+
+	if sw.StatusCode() != http.StatusBadRequest {
+		t.Errorf("expected latched status 400 to be kept, got %d", sw.StatusCode())
+	}
+}
+
 // hijackableRW is a countingRW that also supports hijacking, returning a connection
 // backed by a net.Pipe so the call succeeds without a real server.
 type hijackableRW struct {
@@ -540,6 +597,7 @@ func TestPanicRecover_ErrAbortHandlerPropagates(t *testing.T) {
 	if readErr == nil {
 		t.Error("expected a read error signalling truncation, got clean EOF")
 	}
+	srv.Close() // waits for the handler, which logs the request before re-panicking
 	if strings.Contains(logBuf.String(), "panic recovered") {
 		t.Error("ErrAbortHandler must not be logged as a recovered panic")
 	}

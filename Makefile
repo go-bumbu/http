@@ -6,8 +6,8 @@ default: help
 #==========================================================================================
 ##@ Testing
 #==========================================================================================
-test: ## run fast go tests
-	@go test ./... -cover
+test: ## run go tests with the race detector (needs cgo)
+	@go test -race ./... -cover
 
 lint: ## run go linter
 	# depends on https://github.com/golangci/golangci-lint
@@ -23,21 +23,22 @@ license-check: ## check for invalid licenses
 
 COVERAGE_THRESHOLD ?= 70
 .PHONY: coverage
-coverage: ## check code coverage per package
-	@out=$$(go test -cover -covermode=atomic $$(go list ./middleware/... ./spa/...)) || { echo "$$out"; exit 1; }; \
+coverage: ## check code coverage of every package
+	@out=$$(go test -cover -covermode=atomic $$(go list ./...)) || { echo "$$out"; exit 1; }; \
 	echo "$$out" | awk -v threshold=$(COVERAGE_THRESHOLD) ' \
-		/\[no test files\]/ { printf "⚠️  %-70s no test files\n", $$2; next } \
+		/\[no test files\]/ { printf "❌ %-70s no test files (0%%, below %s%%)\n", $$2, threshold; fail = 1; next } \
 		/coverage:/ { \
+			pkg = ($$1 == "ok") ? $$2 : $$1; \
 			for (i = 1; i <= NF; i++) if ($$i == "coverage:") { cov = $$(i+1); sub(/%/, "", cov); break }; \
-			if (cov + 0 < threshold) { printf "❌ %-70s %s%% (below %s%%)\n", $$2, cov, threshold; fail = 1 } \
-			else { printf "✅ %-70s %s%%\n", $$2, cov } \
+			if (cov + 0 < threshold) { printf "❌ %-70s %s%% (below %s%%)\n", pkg, cov, threshold; fail = 1 } \
+			else { printf "✅ %-70s %s%%\n", pkg, cov } \
 		} \
 		END { exit fail }'
 
 .PHONY: verify
 verify: ## run all checks; runs every check and fails if any fail
 	@fail=0; \
-	for target in test license-check lint benchmark coverage; do \
+	for target in test license-check lint coverage; do \
 		echo "==================== make $$target ===================="; \
 		$(MAKE) --no-print-directory $$target || fail=1; \
 	done; \

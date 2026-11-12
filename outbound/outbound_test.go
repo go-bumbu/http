@@ -3,6 +3,8 @@ package outbound
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -349,6 +351,247 @@ func TestGetClampsRetryAfterToCap(t *testing.T) {
 	}
 }
 
+// When the caller's context ends during the backoff after an upstream 503, the
+// upstream failure must not be lost: the returned error still carries the
+// typed *Error (so HTTPStatus/UserMessage stay precise) and also reports the
+// context error, so errors.Is(err, context.Canceled) keeps working.
+func TestGetKeepsUpstreamErrorWhenContextEndsDuringBackoff(t *testing.T) {
+	for _, ctxErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(ctxErr.Error(), func(t *testing.T) {
+			var hits int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				atomic.AddInt32(&hits, 1)
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}))
+			defer srv.Close()
+
+			c := New(Cfg{
+				Service: "Example Service",
+				Client:  srv.Client(),
+				Wait: func(context.Context, time.Duration) error {
+					return ctxErr // the context ends while we back off
+				},
+			})
+			_, err := c.Get(context.Background(), srv.URL, nil)
+
+			var uerr *Error
+			if !errors.As(err, &uerr) {
+				t.Fatalf("want *outbound.Error in the chain, got %T: %v", err, err)
+			}
+			if uerr.Status != http.StatusServiceUnavailable || uerr.Kind != KindUnavailable {
+				t.Fatalf("upstream error lost: kind=%v status=%d", uerr.Kind, uerr.Status)
+			}
+			if !errors.Is(err, ctxErr) {
+				t.Fatalf("errors.Is(err, %v) = false; err = %v", ctxErr, err)
+			}
+			if got := HTTPStatus(err); got != http.StatusBadGateway {
+				t.Fatalf("HTTPStatus = %d, want 502", got)
+			}
+			if n := atomic.LoadInt32(&hits); n != 1 {
+				t.Fatalf("want 1 attempt before the backoff was cut short, got %d", n)
+			}
+		})
+	}
+}
+
+// Cfg.Timeout caps the whole call. Without it, an upstream that hangs on every
+// attempt costs MaxAttempts per-attempt timeouts plus the backoff; with it, the
+// call ends at the budget and reads as an upstream timeout.
+func TestGetTimeoutCapsWholeCall(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		select { // hang until the client gives up
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	c := New(Cfg{
+		Service: "Example Service",
+		Client:  srv.Client(), // no per-attempt timeout: only the budget can end the call
+		Backoff: 10 * time.Millisecond,
+		Timeout: 100 * time.Millisecond,
+	})
+	start := time.Now()
+	_, err := c.Get(context.Background(), srv.URL, nil)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Get took %v, want it capped near the 100ms budget", elapsed)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("errors.Is(err, DeadlineExceeded) = false; err = %v", err)
+	}
+	var uerr *Error
+	if !errors.As(err, &uerr) || uerr.Kind != KindTimeout {
+		t.Fatalf("want a KindTimeout *outbound.Error, got %T: %v", err, err)
+	}
+	if got := HTTPStatus(err); got != http.StatusGatewayTimeout {
+		t.Fatalf("HTTPStatus = %d, want 504", got)
+	}
+	if n := atomic.LoadInt32(&hits); n != 1 {
+		t.Fatalf("want 1 attempt within the budget, got %d", n)
+	}
+}
+
+// A budget that runs out during the backoff after a 503 ends the call there,
+// keeping the upstream failure rather than replacing it with a timeout.
+func TestGetTimeoutDuringBackoffKeepsUpstreamError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	c := New(Cfg{
+		Service: "Example Service",
+		Client:  srv.Client(),
+		Backoff: 5 * time.Second, // far beyond the budget
+		Timeout: 50 * time.Millisecond,
+	})
+	start := time.Now()
+	_, err := c.Get(context.Background(), srv.URL, nil)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Get took %v, want the backoff cut short by the 50ms budget", elapsed)
+	}
+	var uerr *Error
+	if !errors.As(err, &uerr) || uerr.Status != http.StatusServiceUnavailable || uerr.Kind != KindUnavailable {
+		t.Fatalf("want the upstream 503 *outbound.Error, got %T: %v", err, err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("errors.Is(err, DeadlineExceeded) = false; err = %v", err)
+	}
+}
+
+// A throttle wait that cannot finish within the Cfg.Timeout budget fails at
+// once (rate.Limiter refuses a wait past the deadline before the deadline
+// arrives). That is the budget running out, so it must read as a KindTimeout
+// *Error that matches context.DeadlineExceeded — not a bare throttle error.
+func TestGetThrottleWaitBeyondBudgetIsTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := New(Cfg{
+		Service: "Example Service",
+		Client:  srv.Client(),
+		RPS:     1, // the second call must wait ~1s for a token
+		Timeout: 300 * time.Millisecond,
+	})
+	resp, err := c.Get(context.Background(), srv.URL, nil)
+	if err != nil {
+		t.Fatalf("first Get: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	start := time.Now()
+	_, err = c.Get(context.Background(), srv.URL, nil)
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("Get took %v, want an immediate failure", elapsed)
+	}
+	var uerr *Error
+	if !errors.As(err, &uerr) || uerr.Kind != KindTimeout {
+		t.Fatalf("want a KindTimeout *outbound.Error, got %T: %v", err, err)
+	}
+	if got := HTTPStatus(err); got != http.StatusGatewayTimeout {
+		t.Fatalf("HTTPStatus = %d, want 504", got)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("errors.Is(err, DeadlineExceeded) = false; err = %v", err)
+	}
+}
+
+// When the caller's own deadline is earlier than the Cfg.Timeout budget, a
+// throttle wait that would outlast it is the caller giving up, not the
+// provider being slow: the context error is returned as-is (no *Error), but it
+// still matches context.DeadlineExceeded.
+func TestGetThrottleWaitBeyondCallerDeadlineIsNotBudgetTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := New(Cfg{
+		Service: "Example Service",
+		Client:  srv.Client(),
+		RPS:     1,
+		Timeout: 5 * time.Second, // later than the caller's deadline
+	})
+	resp, err := c.Get(context.Background(), srv.URL, nil)
+	if err != nil {
+		t.Fatalf("first Get: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = c.Get(ctx, srv.URL, nil)
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("Get took %v, want an immediate failure", elapsed)
+	}
+	if err == nil {
+		t.Fatal("expected the throttle wait to fail")
+	}
+	var uerr *Error
+	if errors.As(err, &uerr) {
+		t.Fatalf("caller deadline must not become an upstream *Error, got kind=%v: %v", uerr.Kind, err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("errors.Is(err, DeadlineExceeded) = false; err = %v", err)
+	}
+}
+
+// A limiter whose burst can never admit a request fails for a reason that has
+// nothing to do with any deadline, so it must not be dressed up as one.
+func TestGetThrottleBurstFailureIsNotDeadline(t *testing.T) {
+	c := New(Cfg{
+		Service: "Example Service",
+		Limiter: rate.NewLimiter(1, 0),
+		Timeout: time.Second,
+	})
+	_, err := c.Get(context.Background(), "http://127.0.0.1:0/", nil)
+	if err == nil {
+		t.Fatal("expected the throttle to block the request")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("burst failure reported as a deadline: %v", err)
+	}
+	var uerr *Error
+	if errors.As(err, &uerr) {
+		t.Fatalf("burst failure must not become an upstream *Error, got kind=%v: %v", uerr.Kind, err)
+	}
+}
+
+// The budget also covers reading the body (like http.Client.Timeout), so it
+// must stay alive after Get returns: the response is readable in full, and
+// the budget is released when the caller closes the body.
+func TestGetTimeoutLeavesBodyReadable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()          // Get returns on the headers...
+		time.Sleep(20 * time.Millisecond) // ...before the body arrives
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	c := New(Cfg{Service: "Example Service", Client: srv.Client(), Timeout: time.Second})
+	resp, err := c.Get(context.Background(), srv.URL, nil)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading the body after Get returned: %v", err)
+	}
+	if string(body) != `{"ok":true}` {
+		t.Fatalf("body = %q", body)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
 // Retry-After may be an HTTP-date instead of delay-seconds; it is parsed and
 // then clamped to the cap like any other wait.
 func TestGetParsesHTTPDateRetryAfter(t *testing.T) {
@@ -369,5 +612,145 @@ func TestGetParsesHTTPDateRetryAfter(t *testing.T) {
 		if w != maxRetryAfterWait {
 			t.Fatalf("HTTP-date Retry-After should clamp to %v, got %v", maxRetryAfterWait, *waits)
 		}
+	}
+}
+
+// A retried error response must leave its keep-alive connection reusable:
+// closing an unread body makes the Transport drop the connection, so a 5xx/429
+// storm would open a new TCP/TLS connection for every attempt.
+func TestGetRetryReusesConnection(t *testing.T) {
+	var hits, conns int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			http.Error(w, "upstream is overloaded, try again later", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			atomic.AddInt32(&conns, 1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	c, _ := newTestClient(t, srv)
+	resp, err := c.Get(context.Background(), srv.URL, nil)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	_ = resp.Body.Close()
+	if n := atomic.LoadInt32(&hits); n != 2 {
+		t.Fatalf("want 2 attempts, got %d", n)
+	}
+	if n := atomic.LoadInt32(&conns); n != 1 {
+		t.Fatalf("the retry opened a new connection: %d connections, want 1", n)
+	}
+}
+
+// A caller-supplied User-Agent replaces the configured one rather than being
+// sent alongside it.
+func TestGetCallerUserAgentOverridesConfigured(t *testing.T) {
+	var gotUA, gotAccept []string
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Values("User-Agent")
+		gotAccept = r.Header.Values("Accept")
+	}))
+	defer srv.Close()
+
+	c, _ := newTestClient(t, srv)
+	resp, err := c.Get(context.Background(), srv.URL, http.Header{
+		"User-Agent": []string{"caller/2.0"},
+		"Accept":     []string{"application/json", "text/plain"},
+	})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	_ = resp.Body.Close()
+	if len(gotUA) != 1 || gotUA[0] != "caller/2.0" {
+		t.Fatalf("User-Agent values = %q, want exactly [caller/2.0]", gotUA)
+	}
+	if len(gotAccept) != 2 {
+		t.Fatalf("multi-valued caller header lost values: Accept = %q", gotAccept)
+	}
+}
+
+// A backoff or Retry-After wait that cannot finish before the deadline (the
+// Cfg.Timeout budget or the caller's own) is not slept: the call fails at once
+// with the error the post-sleep path would have produced — the upstream *Error
+// in the chain, matching context.DeadlineExceeded — instead of burning the
+// remaining latency budget on a retry that can never happen.
+func TestGetWaitBeyondDeadlineFailsAtOnce(t *testing.T) {
+	cases := []struct {
+		name       string
+		backoff    time.Duration
+		retryAfter string
+		budget     time.Duration
+		callerTTL  time.Duration
+	}{
+		{name: "backoff beyond budget", backoff: 2 * time.Second, budget: 300 * time.Millisecond},
+		{name: "retry-after beyond budget", backoff: 10 * time.Millisecond, retryAfter: "5", budget: 300 * time.Millisecond},
+		{name: "backoff beyond caller deadline", backoff: 2 * time.Second, callerTTL: 300 * time.Millisecond},
+		{name: "retry-after beyond caller deadline", backoff: 10 * time.Millisecond, retryAfter: "5", callerTTL: 300 * time.Millisecond},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				atomic.AddInt32(&hits, 1)
+				if tc.retryAfter != "" {
+					w.Header().Set("Retry-After", tc.retryAfter)
+				}
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}))
+			defer srv.Close()
+
+			c := New(Cfg{Service: "Example Service", Client: srv.Client(), Backoff: tc.backoff, Timeout: tc.budget})
+			ctx := context.Background()
+			if tc.callerTTL > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, tc.callerTTL)
+				defer cancel()
+			}
+			start := time.Now()
+			_, err := c.Get(ctx, srv.URL, nil)
+			if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+				t.Fatalf("Get took %v, want an immediate failure", elapsed)
+			}
+			var uerr *Error
+			if !errors.As(err, &uerr) || uerr.Status != http.StatusServiceUnavailable || uerr.Kind != KindUnavailable {
+				t.Fatalf("want the upstream 503 *outbound.Error, got %T: %v", err, err)
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("errors.Is(err, DeadlineExceeded) = false; err = %v", err)
+			}
+			if n := atomic.LoadInt32(&hits); n != 1 {
+				t.Fatalf("want 1 attempt, got %d", n)
+			}
+		})
+	}
+}
+
+// A wait that fits in the remaining budget is still slept and retried.
+func TestGetWaitWithinBudgetStillRetries(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := New(Cfg{Service: "Example Service", Client: srv.Client(), Backoff: 10 * time.Millisecond, Timeout: time.Second})
+	resp, err := c.Get(context.Background(), srv.URL, nil)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	_ = resp.Body.Close()
+	if n := atomic.LoadInt32(&hits); n != 2 {
+		t.Fatalf("want 2 attempts, got %d", n)
 	}
 }

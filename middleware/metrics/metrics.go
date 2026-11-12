@@ -118,14 +118,15 @@ func normalizeMethod(method string) string {
 	}
 }
 
-// metricAddr returns the value for the "addr" label. It uses the matched route
-// pattern (e.g. "GET /users/{id}"), a bounded set, and reports "unmatched" for
-// requests that did not match a pattern-aware http.ServeMux route (Go 1.22+).
-// The raw r.URL.Path is attacker-controlled and would create one time series
-// per distinct URL, so it is deliberately never used as a label value.
+// metricAddr returns the value for the "addr" label: the route resolved by the
+// middleware (see middleware.Route — a SetRoute value or the ServeMux pattern such
+// as "GET /users/{id}", after RouteGroups), a bounded set, or "unmatched" when no
+// route matched. The raw r.URL.Path is attacker-controlled and
+// would create one time series per distinct URL, so it is deliberately never used as
+// a label value.
 func metricAddr(r *http.Request) string {
-	if r.Pattern != "" {
-		return r.Pattern
+	if route := middleware.Route(r); route != "" {
+		return route
 	}
 	return "unmatched"
 }

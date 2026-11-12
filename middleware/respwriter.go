@@ -76,12 +76,13 @@ type writerOnly struct {
 
 // WriteHeader records and forwards the response status code. 1xx informational responses
 // (e.g. 103 Early Hints) pass through without latching, so the real final status is still
-// captured and written.
+// captured and written. 101 Switching Protocols is the exception: it ends the HTTP/1.1
+// exchange, so it latches like a final status.
 func (r *StatWriter) WriteHeader(code int) {
 	if r.headerWritten || r.hijacked {
 		return
 	}
-	if code >= 100 && code < 200 {
+	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
 		// 1xx informational responses (e.g. 103 Early Hints) may be sent multiple
 		// times before the final status; pass through without latching, so the
 		// real status code is still captured and written later.
@@ -132,11 +133,16 @@ func (r *StatWriter) FlushError() error {
 
 // Hijack implements http.Hijacker, both for handlers using the type assertion directly
 // and to record that the connection was taken over: after a hijack the middleware must
-// not write a status code or body to the underlying writer.
+// not write a status code or body to the underlying writer. If no status was written yet,
+// 101 Switching Protocols is recorded for logs and metrics (a hijack is typically an
+// upgrade whose raw response the handler writes itself); nothing is written for it.
 func (r *StatWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	conn, brw, err := http.NewResponseController(r.ResponseWriter).Hijack()
 	if err != nil {
 		return nil, nil, err
+	}
+	if !r.headerWritten {
+		r.statusCode = http.StatusSwitchingProtocols
 	}
 	// The handler now writes the raw response itself. hijacked suppresses our header
 	// write; streaming stops the middleware from synthesising a body afterwards.
