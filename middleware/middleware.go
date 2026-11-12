@@ -139,7 +139,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			}
 			// Not recovering: record the request, write nothing, and let the panic carry on
 			// to net/http, which aborts the connection.
-			m.record(r, slot, respWriter, timeStart)
+			m.recordAborted(r, slot, respWriter, timeStart)
 		}()
 
 		next.ServeHTTP(respWriter, r)
@@ -153,21 +153,21 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 // the request and re-panics so net/http aborts the connection.
 func (m *Middleware) recovered(r *http.Request, slot *routeSlot, respWriter *StatWriter, timeStart time.Time, rec any) {
 	if rec == nil {
-		m.record(r, slot, respWriter, timeStart)
+		m.recordAborted(r, slot, respWriter, timeStart)
 		return
 	}
 	if isAbort(rec) {
 		// net/http's sentinel to abort the response so the client sees a truncated reply
 		// (ReverseProxy panics with it when the upstream dies mid-copy). Swallowing it would
 		// make the truncated response look complete; hand it back to net/http.
-		m.record(r, slot, respWriter, timeStart)
+		m.recordAborted(r, slot, respWriter, timeStart)
 		panic(rec)
 	}
 	if !m.handlePanic(r, respWriter, rec, debug.Stack()) {
 		// The response had started: the client already holds a status and maybe part of the
 		// body. Finishing normally would make the truncated reply look complete, so record it
 		// and abort the connection, as net/http does for an unrecovered panic.
-		m.record(r, slot, respWriter, timeStart)
+		m.recordAborted(r, slot, respWriter, timeStart)
 		panic(http.ErrAbortHandler)
 	}
 	m.finalize(r, slot, respWriter, timeStart)
@@ -210,6 +210,18 @@ func (m *Middleware) handlePanic(r *http.Request, respWriter *StatWriter, rec an
 // finalize completes a request that is ending normally: it commits the status and records it.
 func (m *Middleware) finalize(r *http.Request, slot *routeSlot, respWriter *StatWriter, timeStart time.Time) {
 	respWriter.flushHeader()
+	m.record(r, slot, respWriter, timeStart)
+}
+
+// recordAborted records a request whose handler did not return normally and whose connection
+// net/http is about to abort. If no status was committed, the client gets a reset connection,
+// not the StatWriter's default 200, so the request is recorded as a 500 (logged at ERROR);
+// nothing is written to the client. A status already committed (headers flushed, a body
+// written, 101 after a hijack) is what the client saw, so it is recorded unchanged.
+func (m *Middleware) recordAborted(r *http.Request, slot *routeSlot, respWriter *StatWriter, timeStart time.Time) {
+	if !respWriter.Started() && !respWriter.Streaming() {
+		respWriter.statusCode = http.StatusInternalServerError
+	}
 	m.record(r, slot, respWriter, timeStart)
 }
 
