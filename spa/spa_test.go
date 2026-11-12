@@ -212,6 +212,56 @@ func TestHandlerNormalizesPathPrefix(t *testing.T) {
 	}
 }
 
+// PathPrefix matches whole path segments only: /uix.js and /uifoo/bar are not
+// under /ui, so they must 404 instead of serving x.js or the SPA entrypoint.
+func TestHandlerPathPrefixMatchesWholeSegments(t *testing.T) {
+	fsys := mapFS()
+	fsys["x.js"] = &fstest.MapFile{Data: []byte("x js")}
+	fsys["app.js"] = &fstest.MapFile{Data: []byte("root app js")}
+
+	cases := []struct {
+		prefix, target string
+		want           int
+		body           string
+	}{
+		{prefix: "/ui", target: "/uix.js", want: http.StatusNotFound},
+		{prefix: "/ui", target: "/uifoo/bar", want: http.StatusNotFound},
+		{prefix: "/ui", target: "/uifoo/", want: http.StatusNotFound},
+		{prefix: "/ui", target: "/other/app.js", want: http.StatusNotFound},
+		{prefix: "/ui", target: "/%75i/app.js", want: http.StatusNotFound}, // StripPrefix cannot strip the escaped form
+		{prefix: "/ui", target: "/%75i/deep", want: http.StatusNotFound},
+		{prefix: "/ui", target: "/ui", want: http.StatusOK, body: "test index"},
+		{prefix: "/ui", target: "/ui/", want: http.StatusOK, body: "test index"},
+		{prefix: "/ui", target: "/ui/app.js", want: http.StatusOK, body: "root app js"},
+		{prefix: "/ui", target: "/ui/x.js", want: http.StatusOK, body: "x js"},
+		{prefix: "/ui", target: "/ui/users/42", want: http.StatusOK, body: "test index"},
+		{prefix: "/ui", target: "/ui/users/a%2Fb", want: http.StatusOK, body: "test index"},
+		{prefix: "/static/ui", target: "/static/uix.js", want: http.StatusNotFound},
+		{prefix: "/static/ui", target: "/static/ui/x.js", want: http.StatusOK, body: "x js"},
+		{prefix: "", target: "/uix.js", want: http.StatusOK, body: "test index"},
+		{prefix: "", target: "/x.js", want: http.StatusOK, body: "x js"},
+		{prefix: "", target: "/uifoo/bar", want: http.StatusOK, body: "test index"},
+		{prefix: "/", target: "/x.js", want: http.StatusOK, body: "x js"},
+		{prefix: "/", target: "/uifoo/bar", want: http.StatusOK, body: "test index"},
+	}
+	for _, c := range cases {
+		h, err := New(Cfg{FS: fsys, PathPrefix: c.prefix})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodGet, c.target, nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != c.want {
+			t.Errorf("prefix %q %s: code = %d, want %d (body %q)", c.prefix, c.target, w.Code, c.want, w.Body.String())
+			continue
+		}
+		if c.body != "" && w.Body.String() != c.body {
+			t.Errorf("prefix %q %s: body = %q, want %q", c.prefix, c.target, w.Body.String(), c.body)
+		}
+	}
+}
+
 // A SubDir that does not hold index.html — the parent of the build dir, a
 // missing build output, or a path that does not exist — must fail at New
 // instead of serving a directory listing (or a 404) for every deep link.
