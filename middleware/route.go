@@ -37,6 +37,7 @@ type routeSlot struct {
 	captured string // from the innermost CaptureRoute whose ServeMux matched
 	resolved string // final route, written by the Middleware before it calls the Observer
 
+	setDepth      int // scope depth of the request SetRoute was last called on
 	capturedDepth int // scope depth of the CaptureRoute that wrote captured (its handler's depth)
 }
 
@@ -53,14 +54,17 @@ func (s *routeSlot) capture(depth int, pattern string) {
 	}
 }
 
-// source returns the reported route: SetRoute, else CaptureRoute, else pattern.
-// The caller holds s.mu.
+// source returns the reported route: the innermost reporter (SetRoute or CaptureRoute,
+// SetRoute on a tie), else pattern. The caller holds s.mu.
 func (s *routeSlot) source(pattern string) string {
-	if s.set != "" {
+	if s.set != "" && s.setDepth >= s.capturedDepth {
 		return s.set
 	}
 	if s.captured != "" {
 		return s.captured
+	}
+	if s.set != "" {
+		return s.set
 	}
 	return pattern
 }
@@ -96,9 +100,14 @@ func (m *Middleware) withRouteSlot(r *http.Request) (*http.Request, *routeSlot, 
 // through a Middleware with metrics enabled.
 func SetRoute(r *http.Request, route string) {
 	if sc := scopeOf(r); sc != nil {
-		sc.slot.mu.Lock()
-		sc.slot.set = route
-		sc.slot.mu.Unlock()
+		s := sc.slot
+		s.mu.Lock()
+		// An outer router's report (gorilla before dispatch, chi after the handler) must not
+		// override one from inside a CaptureRoute; at the same depth the later call wins.
+		if sc.depth >= s.setDepth {
+			s.set, s.setDepth = route, sc.depth
+		}
+		s.mu.Unlock()
 	}
 }
 
@@ -109,8 +118,9 @@ func SetRoute(r *http.Request, route string) {
 // Middleware never sees, so without CaptureRoute such a route records as unmatched. Place it
 // directly around the mux: m.Wrap(auth(middleware.CaptureRoute(mux))).
 //
-// When several report a route, the most specific wins: a route set with SetRoute, else the
-// innermost CaptureRoute whose mux matched, else the pattern the Middleware itself sees. So
+// When several report a route, the innermost wins: a SetRoute or CaptureRoute (whose mux
+// matched) nested inside more CaptureRoutes beats an outer one, a SetRoute beats a capture at
+// the same depth, and either beats the pattern the Middleware itself sees. So
 // with a mux mounted under another through http.StripPrefix, wrap the inner mux to record its
 // pattern rather than the outer prefix ("/api/"). The inner pattern is relative to the
 // stripped path ("GET /users/{id}", not "/api/users/{id}").
@@ -148,7 +158,7 @@ func CaptureRoute(mux http.Handler) http.Handler {
 }
 
 // Route returns the route an Observer should record for r: the route the Middleware
-// resolved (SetRoute, else CaptureRoute, else r.Pattern, then Cfg.RouteGroups), or "" when
+// resolved (the innermost SetRoute or CaptureRoute, else r.Pattern, then Cfg.RouteGroups), or "" when
 // no route matched. On a request that did not pass through a Middleware it returns r.Pattern.
 func Route(r *http.Request) string {
 	sc := scopeOf(r)
@@ -167,7 +177,7 @@ func Route(r *http.Request) string {
 }
 
 // resolveRoute settles the route for r, after the handler has run, and stores it in the
-// slot for Route to return: SetRoute, else CaptureRoute, else r.Pattern, then mapped through
+// slot for Route to return: the innermost SetRoute or CaptureRoute, else r.Pattern, then mapped through
 // the route groups. Each nested Middleware resolves from the raw sources with its own groups.
 func (m *Middleware) resolveRoute(r *http.Request, s *routeSlot) {
 	s.mu.Lock()

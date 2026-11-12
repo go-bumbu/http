@@ -334,7 +334,7 @@ func TestRoute_CaptureRoute(t *testing.T) {
 		{name: "StripPrefix inner capture wins", h: nested(true), target: "/api/users/1", want: "GET /users/{id}"},
 		{name: "StripPrefix outer capture does not override inner", h: middleware.CaptureRoute(nested(true)), target: "/api/users/1", want: "GET /users/{id}"},
 		{name: "StripPrefix inner miss falls back to outer", h: middleware.CaptureRoute(nested(true)), target: "/api/nope", want: "/api/"},
-		{name: "SetRoute beats capture", h: middleware.CaptureRoute(nested(true)), target: "/api/explicit", want: "/api/explicit"},
+		{name: "inner SetRoute beats its mux capture", h: middleware.CaptureRoute(nested(true)), target: "/api/explicit", want: "/api/explicit"},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
@@ -372,6 +372,91 @@ func TestRoute_CaptureRoute(t *testing.T) {
 			t.Errorf("status = %d, want 200", rec.Code)
 		}
 	})
+}
+
+// setRouteAfter mimics chi's Mount with the README glue: it passes a request copy down and
+// reports its own template with SetRoute after the handler returns.
+func setRouteAfter(template string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), routerKey{}, template)))
+		middleware.SetRoute(r, template)
+	})
+}
+
+// TestRoute_InnermostReporterWins: when an outer router reports its template with SetRoute
+// and a nested ServeMux is wrapped in CaptureRoute, the innermost reporter wins, regardless
+// of whether the outer router reports before or after the handler. At the same depth
+// SetRoute wins, and SetRoute anywhere beats the pattern the Middleware itself sees.
+func TestRoute_InnermostReporterWins(t *testing.T) {
+	inner := http.NewServeMux()
+	inner.Handle("GET /users/{id}", testHandler(200, "ok"))
+	inner.Handle("GET /explicit", setRoute("/explicit"))
+
+	// gorilla: PathPrefix("/api/{version}/").Handler(StripPrefix(CaptureRoute(mux))) with
+	// router.Use(setRoute), which reports before dispatch.
+	gorilla := fakeRouter("/api/{version}/", routeFromRouter(http.StripPrefix("/api/v1", middleware.CaptureRoute(inner))))
+	// chi: Mount("/api", CaptureRoute(mux)) with SetRoute called after the handler.
+	chi := setRouteAfter("/api/*", http.StripPrefix("/api", middleware.CaptureRoute(inner)))
+
+	depth0 := http.NewServeMux()
+	depth0.Handle("GET /p", setRoute("/explicit"))
+
+	tcs := []struct {
+		name   string
+		h      http.Handler
+		target string
+		want   string
+	}{
+		{name: "outer SetRoute before dispatch", h: gorilla, target: "/api/v1/users/1", want: "GET /users/{id}"},
+		{name: "outer SetRoute after the handler", h: chi, target: "/api/users/1", want: "GET /users/{id}"},
+		{name: "inner mux miss falls back to outer SetRoute", h: gorilla, target: "/api/v1/nope", want: "/api/{version}/"},
+		{name: "inner mux miss falls back to outer SetRoute after the handler", h: chi, target: "/api/nope", want: "/api/*"},
+		{name: "inner SetRoute beats outer SetRoute before dispatch", h: gorilla, target: "/api/v1/explicit", want: "/explicit"},
+		{name: "inner SetRoute beats outer SetRoute after the handler", h: chi, target: "/api/explicit", want: "/explicit"},
+		{name: "SetRoute at depth 0 beats the pattern", h: depth0, target: "/p", want: "/explicit"},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := serve(t, middleware.Cfg{}, tc.h, tc.target); got != tc.want {
+				t.Errorf("route = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	// The Middleware resolves while the timed-out handler still runs; the capture recorded
+	// before dispatch is deeper than the outer SetRoute, whenever that is called.
+	for _, tc := range []struct {
+		name string
+		wrap func(http.Handler) http.Handler
+	}{
+		{name: "outer SetRoute before dispatch with timeout", wrap: func(h http.Handler) http.Handler {
+			return fakeRouter("/slow/", routeFromRouter(h))
+		}},
+		{name: "outer SetRoute after the handler with timeout", wrap: func(h http.Handler) http.Handler {
+			return setRouteAfter("/slow/*", h)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			release := make(chan struct{})
+			done := make(chan struct{})
+			mux := http.NewServeMux()
+			mux.Handle("GET /slow/{id}", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				defer close(done)
+				<-release
+			}))
+
+			spy := &statusRouteSpy{}
+			h := middleware.New(middleware.Cfg{Metrics: spy}).
+				Wrap(tc.wrap(http.TimeoutHandler(middleware.CaptureRoute(mux), 50*time.Millisecond, "timeout")))
+			h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/slow/1", nil))
+			close(release)
+			<-done
+
+			if spy.status != http.StatusServiceUnavailable || spy.route != "GET /slow/{id}" {
+				t.Errorf("status = %d, route = %q, want %d and %q", spy.status, spy.route, http.StatusServiceUnavailable, "GET /slow/{id}")
+			}
+		})
+	}
 }
 
 type statusRouteSpy struct {
