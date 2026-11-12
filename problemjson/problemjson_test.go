@@ -670,3 +670,70 @@ func TestOnProblemDevModeCalledOnce(t *testing.T) {
 		t.Fatalf("OnProblem called %d times for two writes, want 2", n)
 	}
 }
+
+// TestStatusNormalised pins that a status outside 400-599 never reaches the
+// client: Write maps it to 500 and WriteUpstream to 502 (no WriteHeader panic
+// on 0, no problem body behind a success status), and the body's status and
+// the OnProblem hook both see the normalised value.
+func TestStatusNormalised(t *testing.T) {
+	var hookStatus int
+	wr, err := New(Cfg{BaseURI: testBaseURI, OnProblem: func(_ *http.Request, d Details) { hookStatus = d.Status }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	write := func(status int) func(http.ResponseWriter, *http.Request) {
+		return func(w http.ResponseWriter, r *http.Request) { wr.Write(w, r, status, SlugInternal, "boom") }
+	}
+	upstream := func(status int) func(http.ResponseWriter, *http.Request) {
+		return func(w http.ResponseWriter, r *http.Request) {
+			wr.WriteUpstream(w, r, stubUpstream{status: status, msg: "down"}, "fallback")
+		}
+	}
+	upstreamReason := func(status int) func(http.ResponseWriter, *http.Request) {
+		return func(w http.ResponseWriter, r *http.Request) {
+			wr.WriteUpstream(w, r, stubUpstreamReason{stubUpstream: stubUpstream{status: status, msg: "down"}, reason: "x"}, "fallback")
+		}
+	}
+	tests := []struct {
+		name  string
+		write func(http.ResponseWriter, *http.Request)
+		want  int
+	}{
+		{"Write 0", write(0), http.StatusInternalServerError},
+		{"Write 200", write(http.StatusOK), http.StatusInternalServerError},
+		{"Write 302", write(http.StatusFound), http.StatusInternalServerError},
+		{"Write 399", write(399), http.StatusInternalServerError},
+		{"Write 600", write(600), http.StatusInternalServerError},
+		{"Write 400", write(http.StatusBadRequest), http.StatusBadRequest},
+		{"Write 404", write(http.StatusNotFound), http.StatusNotFound},
+		{"Write 599", write(599), 599},
+		{"WriteUpstream 0", upstream(0), http.StatusBadGateway},
+		{"WriteUpstream 200", upstream(http.StatusOK), http.StatusBadGateway},
+		{"WriteUpstream 600", upstream(600), http.StatusBadGateway},
+		{"WriteUpstream 429", upstream(http.StatusTooManyRequests), http.StatusTooManyRequests},
+		{"WriteUpstream 503", upstream(http.StatusServiceUnavailable), http.StatusServiceUnavailable},
+		{"WriteUpstream reason 0", upstreamReason(0), http.StatusBadGateway},
+		{"WriteUpstream reason 504", upstreamReason(http.StatusGatewayTimeout), http.StatusGatewayTimeout},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			hookStatus = 0
+			w := httptest.NewRecorder()
+			tc.write(w, httptest.NewRequest(http.MethodGet, "/x", nil))
+
+			if w.Code != tc.want {
+				t.Fatalf("status = %d, want %d", w.Code, tc.want)
+			}
+			var body Details
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode: %v; body=%s", err, w.Body.String())
+			}
+			if body.Status != tc.want {
+				t.Fatalf("body status = %d, want %d", body.Status, tc.want)
+			}
+			if hookStatus != tc.want {
+				t.Fatalf("OnProblem status = %d, want %d", hookStatus, tc.want)
+			}
+		})
+	}
+}

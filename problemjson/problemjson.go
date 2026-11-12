@@ -202,7 +202,12 @@ func New(cfg Cfg) (*Writer, error) {
 // Under ModeMasked the type and title are replaced with the generic
 // SlugMasked identity and detail is omitted; a non-empty reference is
 // included in both modes, and Cfg.OnProblem receives the unmasked Details.
+//
+// A problem is always an error: a status outside 400-599 (0, a 2xx/3xx, or an
+// out-of-range code) is written as 500, and the body's status and the Details
+// passed to Cfg.OnProblem carry that normalised value.
 func (wr *Writer) Write(w http.ResponseWriter, r *http.Request, status int, slug, detail string) {
+	status = errorStatus(status, http.StatusInternalServerError)
 	d := Details{
 		Type:      wr.TypeURI(slug),
 		Title:     wr.TitleFor(slug),
@@ -244,7 +249,8 @@ func (wr *Writer) WriteValidation(w http.ResponseWriter, r *http.Request, detail
 // provider is rate-limiting, 504 on a timeout, otherwise 502 (see
 // UpstreamError.HTTPStatus). Detail is the error's human-readable sentence, or
 // fallback for an error that does not implement UpstreamError — never a raw Go
-// error.
+// error. A status from HTTPStatus outside 400-599 (e.g. 0 from a foreign
+// implementation) is written as 502, in the body and to Cfg.OnProblem too.
 //
 // In dev mode, when err can also name its specific reason (an optional
 // UpstreamReason() string method), that token is added as a "reason" extension
@@ -258,6 +264,7 @@ func (wr *Writer) WriteUpstream(w http.ResponseWriter, r *http.Request, err erro
 	if errors.As(err, &ue) {
 		status, detail = ue.HTTPStatus(), ue.UserMessage()
 	}
+	status = errorStatus(status, http.StatusBadGateway)
 	slug := SlugUpstreamError
 	switch status {
 	case http.StatusTooManyRequests:
@@ -341,6 +348,17 @@ func Slug(typeURI string) string {
 		return typeURI[i+1:]
 	}
 	return typeURI
+}
+
+// errorStatus returns status when it is an HTTP error status (400-599), else
+// fallback, so a problem body never carries a success status and WriteHeader
+// never sees an invalid code. It is the single place the Write methods apply
+// that rule.
+func errorStatus(status, fallback int) int {
+	if status < http.StatusBadRequest || status > 599 {
+		return fallback
+	}
+	return status
 }
 
 // writeProblem sets the problem+json content type and status before encoding
