@@ -5,7 +5,7 @@ This file provides guidance to AI coding agents (e.g. Claude Code) when working 
 ## Commands
 
 ```bash
-make test              # run all tests with coverage
+make test              # run all tests with the race detector and coverage
 make lint              # run golangci-lint (must be installed externally)
 make benchmark         # run benchmarks
 make verify            # run tests + lint + benchmarks + coverage check

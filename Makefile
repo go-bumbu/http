@@ -6,8 +6,8 @@ default: help
 #==========================================================================================
 ##@ Testing
 #==========================================================================================
-test: ## run fast go tests
-	@go test ./... -cover
+test: ## run go tests with the race detector (needs cgo)
+	@go test -race ./... -cover
 
 lint: ## run go linter
 	# depends on https://github.com/golangci/golangci-lint
