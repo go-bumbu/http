@@ -323,7 +323,8 @@ func (c *Client) Get(ctx context.Context, url string, header http.Header, allowS
 	bctx, cancel := context.WithTimeout(ctx, c.timeout)
 	resp, err := c.get(bctx, url, header, allowStatus)
 	if err != nil {
-		budgetSpent := ctx.Err() == nil && bctx.Err() != nil
+		budgetSpent := ctx.Err() == nil &&
+			(bctx.Err() != nil || (errors.Is(err, context.DeadlineExceeded) && budgetIsEarliest(ctx, bctx)))
 		cancel()
 		var uerr *Error
 		if budgetSpent && !errors.As(err, &uerr) {
@@ -337,6 +338,16 @@ func (c *Client) Get(ctx context.Context, url string, header http.Header, allowS
 	// closes the body.
 	resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
 	return resp, nil
+}
+
+// budgetIsEarliest reports whether bctx's deadline (the Cfg.Timeout budget) is
+// earlier than the caller ctx's own. A deadline error raised before either
+// expires (a throttle wait refused for outlasting the deadline) is then ours,
+// not the caller's.
+func budgetIsEarliest(ctx, bctx context.Context) bool {
+	budget, _ := bctx.Deadline()
+	caller, ok := ctx.Deadline()
+	return !ok || budget.Before(caller)
 }
 
 // cancelOnClose releases a Get's time budget when the response body is closed.
@@ -456,7 +467,7 @@ func (c *Client) do(ctx context.Context, url string, header http.Header) (*http.
 	}
 	if c.limiter != nil {
 		if err := c.limiter.Wait(ctx); err != nil {
-			return nil, fmt.Errorf("%s throttle: %w", c.service, err)
+			return nil, c.throttleError(ctx, err)
 		}
 	}
 	resp, err := c.client.Do(req)
@@ -473,6 +484,21 @@ func (c *Client) do(ctx context.Context, url string, header http.Header) (*http.
 		return nil, &Error{Service: c.service, Kind: kind, Err: err, retryable: true}
 	}
 	return resp, nil
+}
+
+// throttleError wraps a failed limiter wait. rate.Limiter fails a wait that
+// would outlast ctx's deadline at once, before the deadline arrives, with an
+// error that does not match context.DeadlineExceeded (and ctx.Err() is still
+// nil). That is the deadline running out all the same, so it is made to match
+// context.DeadlineExceeded; a limiter whose burst can never admit a request
+// fails for an unrelated reason and is left as-is.
+func (c *Client) throttleError(ctx context.Context, err error) error {
+	_, hasDeadline := ctx.Deadline()
+	burstFailure := c.limiter.Burst() < 1 && c.limiter.Limit() != rate.Inf
+	if hasDeadline && ctx.Err() == nil && !burstFailure {
+		return fmt.Errorf("%s throttle: %w: %w", c.service, context.DeadlineExceeded, err)
+	}
+	return fmt.Errorf("%s throttle: %w", c.service, err)
 }
 
 // statusError classifies a non-2xx response. 5xx and 429 are transient (worth

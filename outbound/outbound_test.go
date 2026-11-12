@@ -462,6 +462,107 @@ func TestGetTimeoutDuringBackoffKeepsUpstreamError(t *testing.T) {
 	}
 }
 
+// A throttle wait that cannot finish within the Cfg.Timeout budget fails at
+// once (rate.Limiter refuses a wait past the deadline before the deadline
+// arrives). That is the budget running out, so it must read as a KindTimeout
+// *Error that matches context.DeadlineExceeded — not a bare throttle error.
+func TestGetThrottleWaitBeyondBudgetIsTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := New(Cfg{
+		Service: "Example Service",
+		Client:  srv.Client(),
+		RPS:     1, // the second call must wait ~1s for a token
+		Timeout: 300 * time.Millisecond,
+	})
+	resp, err := c.Get(context.Background(), srv.URL, nil)
+	if err != nil {
+		t.Fatalf("first Get: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	start := time.Now()
+	_, err = c.Get(context.Background(), srv.URL, nil)
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("Get took %v, want an immediate failure", elapsed)
+	}
+	var uerr *Error
+	if !errors.As(err, &uerr) || uerr.Kind != KindTimeout {
+		t.Fatalf("want a KindTimeout *outbound.Error, got %T: %v", err, err)
+	}
+	if got := HTTPStatus(err); got != http.StatusGatewayTimeout {
+		t.Fatalf("HTTPStatus = %d, want 504", got)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("errors.Is(err, DeadlineExceeded) = false; err = %v", err)
+	}
+}
+
+// When the caller's own deadline is earlier than the Cfg.Timeout budget, a
+// throttle wait that would outlast it is the caller giving up, not the
+// provider being slow: the context error is returned as-is (no *Error), but it
+// still matches context.DeadlineExceeded.
+func TestGetThrottleWaitBeyondCallerDeadlineIsNotBudgetTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := New(Cfg{
+		Service: "Example Service",
+		Client:  srv.Client(),
+		RPS:     1,
+		Timeout: 5 * time.Second, // later than the caller's deadline
+	})
+	resp, err := c.Get(context.Background(), srv.URL, nil)
+	if err != nil {
+		t.Fatalf("first Get: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = c.Get(ctx, srv.URL, nil)
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("Get took %v, want an immediate failure", elapsed)
+	}
+	if err == nil {
+		t.Fatal("expected the throttle wait to fail")
+	}
+	var uerr *Error
+	if errors.As(err, &uerr) {
+		t.Fatalf("caller deadline must not become an upstream *Error, got kind=%v: %v", uerr.Kind, err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("errors.Is(err, DeadlineExceeded) = false; err = %v", err)
+	}
+}
+
+// A limiter whose burst can never admit a request fails for a reason that has
+// nothing to do with any deadline, so it must not be dressed up as one.
+func TestGetThrottleBurstFailureIsNotDeadline(t *testing.T) {
+	c := New(Cfg{
+		Service: "Example Service",
+		Limiter: rate.NewLimiter(1, 0),
+		Timeout: time.Second,
+	})
+	_, err := c.Get(context.Background(), "http://127.0.0.1:0/", nil)
+	if err == nil {
+		t.Fatal("expected the throttle to block the request")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("burst failure reported as a deadline: %v", err)
+	}
+	var uerr *Error
+	if errors.As(err, &uerr) {
+		t.Fatalf("burst failure must not become an upstream *Error, got kind=%v: %v", uerr.Kind, err)
+	}
+}
+
 // The budget also covers reading the body (like http.Client.Timeout), so it
 // must stay alive after Get returns: the response is readable in full, and
 // the budget is released when the caller closes the body.
