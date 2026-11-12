@@ -43,6 +43,22 @@ mux.Handle("/", m.Wrap(handler))
 
 It depends only on the standard library; Prometheus is pulled in only when you import `middleware/metrics`.
 
+The logged `url` field is the request path only: the query string is never logged, since it often carries tokens or signatures.
+
+The logged `ip` field is the direct peer by default; forwarding headers are ignored because any client can set them. Behind a reverse proxy, tell the middleware which proxies to trust so it logs the real client:
+
+```go
+middleware.Cfg{
+    Logger:   slog.Default(),
+    ClientIP: middleware.ClientIPFromXFF(netip.MustParsePrefix("10.0.0.0/8")),
+}
+```
+
+- `ClientIPDirect` — the peer address, no headers (default)
+- `ClientIPFromRealIP(trusted...)` — `X-Real-Ip`, when the peer is a trusted proxy
+- `ClientIPFromXFF(trusted...)` — `X-Forwarded-For`, walked right to left past trusted proxies
+- `ClientIPFromXFFHops(n)` — `X-Forwarded-For` by position, for proxies without a stable address range
+
 `ReqDelay` is a standalone, development-only helper: `middleware.ReqDelay{...}.Delay` adds a random delay between a min and max duration to simulate slow backends.
 
 #### middleware/metrics
@@ -52,6 +68,77 @@ histogram and wraps it as a `middleware.Observer` for `middleware.Cfg.Metrics`
 (`NopObserver` returns an explicit no-op). Request labels are bounded to closed sets
 to avoid time-series cardinality blow-ups. This is the only package that imports the
 Prometheus client, so importing `middleware` alone stays dependency-free.
+
+#### Route labels
+
+Metrics are labelled by route template (`/users/{id}`), never by raw path, so
+`/users/1` and `/users/2` share one series. The middleware resolves the route after the
+handler runs: a route reported with `middleware.SetRoute`, else the `http.ServeMux`
+pattern; anything else records as `unmatched`.
+
+With `http.ServeMux` nothing is needed. Other routers report their match with
+`SetRoute`, from a router-level middleware. gorilla/mux:
+
+```go
+// Reports gorilla's matched template. gorilla runs Use middlewares after matching.
+setGorillaRoute := func(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if route := mux.CurrentRoute(r); route != nil {
+            if tmpl, err := route.GetPathTemplate(); err == nil {
+                middleware.SetRoute(r, tmpl)
+            }
+        }
+        next.ServeHTTP(w, r)
+    })
+}
+m := middleware.New(middleware.Cfg{Metrics: obs})
+router := mux.NewRouter()
+
+// A) wrap the whole router: every request is seen, including 404/405.
+router.Use(setGorillaRoute)
+http.ListenAndServe(":8080", m.Wrap(router))
+
+// B) or inside the router. Order matters: m.Wrap first, so the setter runs inside it.
+// gorilla skips Use middlewares for 404/405, so wrap those handlers too.
+router.Use(m.Wrap, setGorillaRoute)
+router.NotFoundHandler = m.Wrap(http.NotFoundHandler())
+router.MethodNotAllowedHandler = m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+    http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+}))
+```
+
+Use one setup, not both: every request would be logged and counted twice.
+
+chi runs `Use` middlewares *before* routing, so read the pattern after the handler:
+
+```go
+router := chi.NewRouter()
+router.Use(func(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        next.ServeHTTP(w, r)
+        middleware.SetRoute(r, chi.RouteContext(r.Context()).RoutePattern())
+    })
+})
+http.ListenAndServe(":8080", m.Wrap(router))
+```
+
+Pass `SetRoute` a template, never the raw path: each distinct value is a new series.
+
+Notes:
+- Route shapes differ by router: a `ServeMux` pattern keeps its method when registered
+  with one (`GET /users/{id}`), a gorilla or chi template has none (`/users/{id}`). The
+  method is always its own label as well.
+- A wrapper that copies the request between the middleware and a `ServeMux`
+  (`http.StripPrefix`, `http.TimeoutHandler`) hides the pattern from the middleware;
+  report the route with `SetRoute` instead.
+- With metrics on, handlers receive a copy of the request. The middleware copies
+  `r.Pattern` back for wrappers outside it, but not the path values: `r.PathValue` is
+  empty outside the middleware.
+
+`Cfg.RouteGroups` collapses routes under a prefix into one series:
+`RouteGroups: []string{"/api"}` records `GET /api/apple` and `GET /api/banana` as
+`GET /api`. Entries are paths (a method is stripped, a host is not supported); they
+match whole segments (`/api` does not group `/apiary`) and the longest wins.
 
 ### spa
 

@@ -1,6 +1,6 @@
-<!-- todo:guide — managed by todo; this block is rewritten on save. Docs: https://github.com/andresbott/todo
+<!-- todo:guide — managed by todo; this block is rewritten on save. Docs: https://github.com/candy-tools/todo
 This file is a todo list managed by "todo", a terminal TODO app:
-https://github.com/andresbott/todo
+https://github.com/candy-tools/todo
 
 todo watches this file and reloads it automatically when it changes on disk, so
 you — human or agent — can edit it directly in any editor. Keep to this format
@@ -18,4 +18,10 @@ Notes for editors:
 - Text above the first heading (this block included) is preserved on save.
 - todo rewrites the file into the canonical form above on every change, so any
   other free-form markdown placed between items is not kept.
+
+Prefer the CLI over editing by hand: it writes this file in the exact format
+above. `todo add`, `todo done|progress|defer|reopen`, `todo edit`, `todo rm`
+and `todo list --json` cover the common actions — run `todo --help`.
 -->
+
+# Middleware

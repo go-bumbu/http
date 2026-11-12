@@ -87,10 +87,10 @@ func (m *Middleware) log(r *http.Request, statusCode int, errmsg string, dur tim
 
 	attrs := []slog.Attr{
 		slog.String("method", r.Method),
-		slog.String("url", r.RequestURI),
+		slog.String("url", logURL(r)),
 		slog.Duration("req-dur", dur),
 		slog.Int("response-code", statusCode),
-		slog.String("ip", userIp(r)),
+		slog.String("ip", m.clientIP(r)),
 		slog.String("req-id", m.requestID(r)),
 	}
 	if IsStatusError(statusCode) {
@@ -118,7 +118,7 @@ func (m *Middleware) logHeadersDebug(r *http.Request, respHeaders http.Header) {
 	}
 	attrs := []slog.Attr{
 		slog.String("method", r.Method),
-		slog.String("url", r.RequestURI),
+		slog.String("url", logURL(r)),
 		slog.String("req-id", m.requestID(r)),
 		m.redact.headerAttrs("req-headers", r.Header, m.disableRedaction),
 		m.redact.headerAttrs("resp-headers", respHeaders, m.disableRedaction),
@@ -126,17 +126,9 @@ func (m *Middleware) logHeadersDebug(r *http.Request, respHeaders http.Header) {
 	m.logger.LogAttrs(r.Context(), slog.LevelDebug, "", attrs...)
 }
 
-// userIp returns the client IP for logging. X-Real-Ip and X-Forwarded-For are trusted
-// unconditionally: this assumes the server runs behind a reverse proxy that sets them.
-// If the server is exposed directly, clients can spoof these headers — do not use the
-// logged IP for security decisions.
-func userIp(r *http.Request) string {
-	IPAddress := r.Header.Get("X-Real-Ip")
-	if IPAddress == "" {
-		IPAddress = r.Header.Get("X-Forwarded-For")
-	}
-	if IPAddress == "" {
-		IPAddress = r.RemoteAddr
-	}
-	return IPAddress
+// logURL returns the request path for the "url" log field. The query string is deliberately
+// dropped: it often carries tokens, signatures, or reset codes that must not end up in logs.
+// The escaped form is used so an encoded "%2F" stays distinguishable from a real "/".
+func logURL(r *http.Request) string {
+	return r.URL.EscapedPath()
 }
