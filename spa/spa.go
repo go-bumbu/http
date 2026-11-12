@@ -112,8 +112,20 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 	default:
-		http.StripPrefix(h.pathPrefix, http.FileServerFS(h.fs)).ServeHTTP(w, r)
+		http.StripPrefix(h.pathPrefix, http.FileServerFS(h.fs)).ServeHTTP(w, withURLCopy(r))
 	}
+}
+
+// withURLCopy returns a shallow copy of r with its own URL, so the file server
+// cannot mutate the caller's request: http.StripPrefix("") passes r through
+// as-is, and the file server then rewrites r.URL.Path to add a leading slash
+// (e.g. "app.js" left by an outer http.StripPrefix("/static/", ...)).
+func withURLCopy(r *http.Request) *http.Request {
+	r2 := new(http.Request)
+	*r2 = *r
+	u := *r.URL
+	r2.URL = &u
+	return r2
 }
 
 // hasHiddenSegment reports whether any element of the slash-separated path

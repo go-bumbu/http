@@ -251,6 +251,46 @@ func TestHandlerServesIndexForDeepLinks(t *testing.T) {
 	}
 }
 
+// The handler must never mutate the caller's request: an outer wrapper (e.g.
+// logging middleware) reads r.URL after ServeHTTP returns, and a deep link
+// once came back as url=/ because the fallback rewrote r.URL.Path.
+func TestHandlerDoesNotMutateRequest(t *testing.T) {
+	cases := []struct {
+		name, prefix, target string
+		path                 string // overrides the parsed Path, e.g. as left by an outer http.StripPrefix
+	}{
+		{name: "root deep link", target: "/users/42"},
+		{name: "root asset", target: "/assets/app.js"},
+		{name: "root dotfile", target: "/.env"},
+		{name: "root index", target: "/"},
+		{name: "prefixed deep link", prefix: "/ui", target: "/ui/users/42"},
+		{name: "prefixed escaped deep link", prefix: "/ui", target: "/ui/users/a%2Fb"},
+		{name: "prefixed asset", prefix: "/ui", target: "/ui/assets/app.js"},
+		{name: "prefixed escaped asset", prefix: "/ui", target: "/ui/assets/app%2Ejs"},
+		{name: "prefixed directory", prefix: "/ui", target: "/ui/assets/"},
+		{name: "root asset without leading slash", target: "/assets/app.js", path: "assets/app.js"},
+		{name: "root deep link without leading slash", target: "/users/42", path: "users/42"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h, err := New(Cfg{FS: mapFS(), PathPrefix: c.prefix})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodGet, c.target, nil)
+			if c.path != "" {
+				req.URL.Path = c.path
+			}
+			wantURL := *req.URL
+			h.ServeHTTP(httptest.NewRecorder(), req)
+			if req.URL.Path != wantURL.Path || req.URL.RawPath != wantURL.RawPath {
+				t.Errorf("caller's URL mutated: Path=%q RawPath=%q, want Path=%q RawPath=%q",
+					req.URL.Path, req.URL.RawPath, wantURL.Path, wantURL.RawPath)
+			}
+		})
+	}
+}
+
 // If index.html vanishes after New (an os.DirFS build dir being rebuilt), a
 // deep link must 404 rather than fall back to a directory listing.
 func TestHandlerNeverListsDirectory(t *testing.T) {
