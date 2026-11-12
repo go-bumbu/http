@@ -43,6 +43,14 @@ mux.Handle("/", m.Wrap(handler))
 
 It depends only on the standard library; Prometheus is pulled in only when you import `middleware/metrics`.
 
+Panics are logged and recorded once, then handled like net/http does:
+
+- `PanicRecover: true`, response not started yet: the client gets a `500 Internal Server Error` and `Wrap` returns normally.
+- `PanicRecover: true`, response already started (a status written, body bytes written, flushed, or hijacked): a 500 can no longer be sent, so `Wrap` re-panics with `http.ErrAbortHandler` and net/http aborts the connection, letting the client detect the truncated reply. A handler's own `http.ErrAbortHandler` panic (e.g. from `httputil.ReverseProxy`) is passed through the same way.
+- `PanicRecover: false`: nothing is written; the panic is recorded (as a 500 if no status was sent) and carries on out of `Wrap`.
+
+So a panic can escape `Wrap` either way: an outer recoverer will see it, and a test that calls the handler directly with `httptest.ResponseRecorder` must expect the panic rather than a normal return.
+
 The logged `url` field is the request path only: the query string is never logged, since it often carries tokens or signatures.
 
 The logged `ip` field is the direct peer by default; forwarding headers are ignored because any client can set them. Behind a reverse proxy, tell the middleware which proxies to trust so it logs the real client:

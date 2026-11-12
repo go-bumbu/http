@@ -20,6 +20,24 @@ type Observer interface {
 }
 
 type Cfg struct {
+	// PanicRecover controls what Wrap does when the handler panics. Every panic is logged and
+	// observed exactly once either way; a request aborted before any status was committed is
+	// recorded as 500.
+	//
+	// When true, a panic before the response has started (no final status written via
+	// WriteHeader, no Write, flush, or hijack) is logged with its stack and turned into a 500
+	// "Internal Server Error" response, and Wrap returns normally. A panic after the response
+	// has started cannot be turned into a clean reply: it is logged and recorded, then Wrap
+	// re-panics with http.ErrAbortHandler so net/http aborts the connection and the client
+	// detects the truncation. A handler that panics with http.ErrAbortHandler itself (e.g.
+	// httputil.ReverseProxy when the upstream dies mid-copy) is recorded and re-panicked as is.
+	//
+	// When false, nothing is written to the client: the panic is recorded and then propagates
+	// out of Wrap unchanged, and net/http aborts the connection.
+	//
+	// So with either setting a panic can escape Wrap: an outer recoverer sees it, and a test
+	// calling the handler directly with httptest.ResponseRecorder must expect it (e.g. with a
+	// deferred recover) instead of a normal return.
 	PanicRecover bool
 	Logger       Logger
 	Metrics      Observer
@@ -111,7 +129,9 @@ type Middleware struct {
 
 // Wrap returns an http.Handler that runs next with the configured request logging, metrics,
 // and panic recovery. It never modifies the response body; see the Middleware type doc for
-// the streaming, error-tee, and passthrough guarantees.
+// the streaming, error-tee, and passthrough guarantees. A handler panic may re-panic out of the
+// returned handler (always when PanicRecover is false; as http.ErrAbortHandler when the
+// response had already started); see Cfg.PanicRecover.
 func (m *Middleware) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// With metrics on, pass a copy carrying the route slot down the chain. ServeMux sets
