@@ -208,14 +208,7 @@ func New(cfg Cfg) (*Writer, error) {
 // passed to Cfg.OnProblem carry that normalised value.
 func (wr *Writer) Write(w http.ResponseWriter, r *http.Request, status int, slug, detail string) {
 	status = errorStatus(status, http.StatusInternalServerError)
-	d := Details{
-		Type:      wr.TypeURI(slug),
-		Title:     wr.TitleFor(slug),
-		Status:    status,
-		Detail:    detail,
-		Instance:  r.URL.Path,
-		Reference: wr.reference(r),
-	}
+	d := wr.details(r, status, slug, detail)
 	wr.notify(r, d)
 	if wr.mode == ModeMasked {
 		d = wr.mask(d)
@@ -229,14 +222,7 @@ func (wr *Writer) Write(w http.ResponseWriter, r *http.Request, status int, slug
 // to the generic SlugMasked identity (still 422).
 func (wr *Writer) WriteValidation(w http.ResponseWriter, r *http.Request, detail string, fields ...FieldError) {
 	const status = http.StatusUnprocessableEntity
-	d := Details{
-		Type:      wr.TypeURI(SlugValidationError),
-		Title:     wr.TitleFor(SlugValidationError),
-		Status:    status,
-		Detail:    detail,
-		Instance:  r.URL.Path,
-		Reference: wr.reference(r),
-	}
+	d := wr.details(r, status, SlugValidationError, detail)
 	wr.notify(r, d)
 	if wr.mode == ModeMasked {
 		writeProblem(w, status, wr.mask(d))
@@ -277,14 +263,7 @@ func (wr *Writer) WriteUpstream(w http.ResponseWriter, r *http.Request, err erro
 		var ur upstreamReasoner
 		if errors.As(err, &ur) {
 			if reason := ur.UpstreamReason(); reason != "" {
-				d := Details{
-					Type:      wr.TypeURI(slug),
-					Title:     wr.TitleFor(slug),
-					Status:    status,
-					Detail:    detail,
-					Instance:  r.URL.Path,
-					Reference: wr.reference(r),
-				}
+				d := wr.details(r, status, slug, detail)
 				wr.notify(r, d)
 				writeProblem(w, status, upstreamDetails{Details: d, Reason: reason})
 				return
@@ -309,6 +288,20 @@ func (wr *Writer) TitleFor(slug string) string {
 		return title
 	}
 	return slug
+}
+
+// details builds the unmasked Details for a problem: the one place every Write
+// path derives Type, Title, Instance, and Reference, so they cannot drift.
+// status must already be normalised by errorStatus.
+func (wr *Writer) details(r *http.Request, status int, slug, detail string) Details {
+	return Details{
+		Type:      wr.TypeURI(slug),
+		Title:     wr.TitleFor(slug),
+		Status:    status,
+		Detail:    detail,
+		Instance:  r.URL.Path,
+		Reference: wr.reference(r),
+	}
 }
 
 // mask rewrites d for ModeMasked: a generic type/title and no detail,
