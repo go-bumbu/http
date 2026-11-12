@@ -534,31 +534,3 @@ func TestRoute_Groups(t *testing.T) {
 type nopObserver struct{}
 
 func (nopObserver) Observe(int, *http.Request, time.Duration) {}
-
-// BenchmarkWrap measures the per-request cost of the Middleware with and without metrics
-// (the route slot and request copy are only added with metrics), and of CaptureRoute's
-// extra request copy and deeper scope.
-func BenchmarkWrap(b *testing.B) {
-	mux := http.NewServeMux()
-	mux.Handle("GET /users/{id}", testHandler(200, "ok"))
-	for _, bc := range []struct {
-		name    string
-		cfg     middleware.Cfg
-		handler http.Handler
-	}{
-		{name: "no metrics", cfg: middleware.Cfg{}, handler: mux},
-		{name: "metrics", cfg: middleware.Cfg{Metrics: nopObserver{}}, handler: mux},
-		{name: "metrics+groups", cfg: middleware.Cfg{Metrics: nopObserver{}, RouteGroups: []string{"/users"}}, handler: mux},
-		{name: "metrics+CaptureRoute", cfg: middleware.Cfg{Metrics: nopObserver{}}, handler: middleware.CaptureRoute(mux)},
-	} {
-		b.Run(bc.name, func(b *testing.B) {
-			h := middleware.New(bc.cfg).Wrap(bc.handler)
-			r := httptest.NewRequest("GET", "/users/1", nil)
-			w := httptest.NewRecorder()
-			b.ReportAllocs()
-			for b.Loop() {
-				h.ServeHTTP(w, r)
-			}
-		})
-	}
-}

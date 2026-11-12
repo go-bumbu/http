@@ -8,7 +8,7 @@ This file provides guidance to AI coding agents (e.g. Claude Code) when working 
 make test              # run all tests with the race detector and coverage
 make lint              # run golangci-lint (must be installed externally)
 make benchmark         # run benchmarks
-make verify            # run tests + lint + benchmarks + coverage check
+make verify            # run tests + license check + lint + coverage check (incl. TestWrapResourceBudget)
 go test ./...          # run all tests
 go test ./middleware/  # run tests for a single package
 go test ./middleware/ -run TestMiddleware  # run a single test

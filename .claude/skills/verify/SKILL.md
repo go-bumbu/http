@@ -1,13 +1,13 @@
 ---
 name: verify
-description: Use when the user runs /verify or asks to run make verify. Runs the full verification suite (tests, lint, coverage, benchmarks, license) and fixes every issue found.
+description: Use when the user runs /verify or asks to run make verify. Runs the full verification suite (tests, license, lint, coverage) and fixes every issue found.
 ---
 
 # verify
 
 Run `make verify` and fix all issues until it passes clean.
 
-`make verify` runs in order: `test` → `ui-test` → `license-check` → `lint` → `benchmark` → `coverage`
+`make verify` runs in order: `test` → `license-check` → `lint` → `coverage`
 
 ## How to run
 

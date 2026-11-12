@@ -38,7 +38,7 @@ coverage: ## check code coverage of every package
 .PHONY: verify
 verify: ## run all checks; runs every check and fails if any fail
 	@fail=0; \
-	for target in test license-check lint benchmark coverage; do \
+	for target in test license-check lint coverage; do \
 		echo "==================== make $$target ===================="; \
 		$(MAKE) --no-print-directory $$target || fail=1; \
 	done; \
